@@ -1,0 +1,9 @@
+{
+	"id": "semantic-connections",
+	"name": "Semantic Connections",
+	"version": "0.1.0",
+	"minAppVersion": "1.0.0",
+	"description": "为 vault 中的笔记建立语义索引，展示相关笔记及最契合的段落",
+	"author": "",
+	"isDesktopOnly": true
+}

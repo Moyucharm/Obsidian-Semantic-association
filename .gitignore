@@ -1,0 +1,17 @@
+# build output
+main.js
+*.js.map
+
+# npm
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+
+# env
+.env
+.env.*
+
+# obsidian
+data.json

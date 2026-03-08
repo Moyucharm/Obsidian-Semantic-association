@@ -1,0 +1,118 @@
+/**
+ * 插件全局类型定义
+ *
+ * 定义 note、chunk、搜索结果等核心数据结构，
+ * 所有模块共享这些类型以保证一致性。
+ */
+
+/** 向量类型：固定长度的浮点数组 */
+export type Vector = number[];
+
+/**
+ * Note 元数据
+ * 代表 vault 中一篇 Markdown 文件的索引信息
+ */
+export interface NoteMeta {
+	/** 文件在 vault 中的相对路径（唯一标识） */
+	path: string;
+	/** 笔记标题（通常取文件名或首行标题） */
+	title: string;
+	/** 文件最后修改时间戳（ms） */
+	mtime: number;
+	/** 文件内容 hash，用于判断是否需要重新索引 */
+	hash: string;
+	/** 笔记中的标签列表 */
+	tags: string[];
+	/** 笔记中的出链路径列表 */
+	outgoingLinks: string[];
+	/** 笔记摘要文本（用于生成 note-level embedding） */
+	summaryText: string;
+	/** note-level 向量（可选，用于粗筛） */
+	vector?: Vector;
+}
+
+/**
+ * Chunk 元数据
+ * 代表一篇笔记中的一个语义块（标题块或段落块）
+ */
+export interface ChunkMeta {
+	/** chunk 唯一标识：`${notePath}#${order}` */
+	chunkId: string;
+	/** 所属笔记路径 */
+	notePath: string;
+	/** chunk 所在的标题（若有） */
+	heading: string;
+	/** chunk 原始文本内容 */
+	text: string;
+	/** chunk 在笔记中的顺序（从 0 开始） */
+	order: number;
+	/** chunk-level 向量 */
+	vector?: Vector;
+}
+
+/**
+ * 连接结果项
+ * 表示一条与当前笔记相关的推荐结果
+ */
+export interface ConnectionResult {
+	/** 相关笔记路径 */
+	notePath: string;
+	/** 笔记标题 */
+	title: string;
+	/** note-level 相似度分数 */
+	score: number;
+	/** 最佳匹配段落（passage） */
+	bestPassage: PassageResult;
+}
+
+/**
+ * 段落匹配结果
+ * 从候选笔记中选出的最契合段落
+ */
+export interface PassageResult {
+	/** 段落所属的 chunkId */
+	chunkId: string;
+	/** 段落所在标题 */
+	heading: string;
+	/** 段落文本内容 */
+	text: string;
+	/** chunk-level 相似度分数 */
+	score: number;
+}
+
+/**
+ * Lookup 搜索结果项
+ * 语义搜索返回的单条结果
+ */
+export interface LookupResult {
+	/** 笔记路径 */
+	notePath: string;
+	/** 笔记标题 */
+	title: string;
+	/** 匹配的最佳段落 */
+	passage: PassageResult;
+	/** 综合相关度分数 */
+	score: number;
+}
+
+/**
+ * 插件设置
+ */
+export interface SemanticConnectionsSettings {
+	/** 每次展示的最大相关笔记数 */
+	maxConnections: number;
+	/** 排除的文件夹路径列表 */
+	excludedFolders: string[];
+	/** embedding provider 类型 */
+	embeddingProvider: "mock" | "local" | "remote";
+	/** 自动索引是否开启 */
+	autoIndex: boolean;
+}
+
+/** 插件默认设置 */
+export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
+	maxConnections: 20,
+	excludedFolders: [],
+	embeddingProvider: "mock",
+	autoIndex: true,
+};
