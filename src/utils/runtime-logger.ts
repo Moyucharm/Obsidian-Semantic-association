@@ -40,7 +40,7 @@ export class RuntimeLogger {
 				event: "runtime-log-load-failed",
 				level: "warn",
 				category: "storage",
-				message: "Failed to load persisted runtime log. A fresh log will be created.",
+				message: "加载持久化运行日志失败，将重新创建日志。",
 				details: [
 					`log_path=${this.logPath}`,
 					`cause=${err instanceof Error ? err.message : String(err)}`,

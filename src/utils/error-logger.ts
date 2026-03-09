@@ -6,7 +6,7 @@
  * │  被谁调用：                                                          │
  * │    - ReindexService（索引失败时写入日志）                             │
  * │    - main.ts（启动时加载日志 + 清理）                                │
- * │  参见：ARCHITECTURE.md「十、错误日志机制」                            │
+ * │  参见：docs/ARCHITECTURE.md「十、错误日志机制」                      │
  * └──────────────────────────────────────────────────────────────────────┘
  *
  * ## 为什么需要 ErrorLogger
@@ -25,14 +25,14 @@
  *
  * ### 1. 容量上限（MAX_ENTRIES = 500）
  * 每次 log() 时检查，超过上限则截断最旧的条目。
- * 这能防止 API Key 失效等场景下短时间暴增到几千条。
+ * 这能防止 Embedding 配置异常等场景下短时间暴增到几千条。
  *
  * ### 2. 时间过期（30 天）
  * 启动时执行懒清理，删除 30 天前的条目。
  * 确保长期不出错的用户不会一直累积旧数据。
  *
  * ### 为什么不用纯定期删除？
- * - 如果短时间内大量失败（如 API Key 失效），日志可能暴增，纯时间控制不住
+ * - 如果短时间内大量失败（如 Embedding 配置异常），日志可能暴增，纯时间控制不住
  * - 如果用户长时间没有错误，30 天定期清理是浪费
  * - 容量上限提供了实时保护，时间过期提供了周期性清理
  *
@@ -114,7 +114,7 @@ export class ErrorLogger {
 			this.log({
 				filePath: this.logPath,
 				errorType: "runtime",
-				message: "Failed to load persisted error log. A fresh log will be created.",
+				message: "加载持久化错误日志失败，将重新创建日志。",
 				errorName: err instanceof Error ? err.name : undefined,
 				stack: err instanceof Error ? err.stack : undefined,
 				stage: "error-log-load",
@@ -161,7 +161,7 @@ export class ErrorLogger {
 	 * ## 容量保护
 	 *
 	 * 每次 log 后检查是否超过 MAX_ENTRIES。超过时截断最旧的条目，
-	 * 防止异常场景（如 API Key 失效导致所有文件都失败）下日志暴增。
+	 * 防止异常场景（如 Embedding 配置异常导致所有文件都失败）下日志暴增。
 	 */
 	log(entry: Omit<IndexErrorEntry, "timestamp">): void {
 		this.entries.push({

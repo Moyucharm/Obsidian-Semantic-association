@@ -4,7 +4,7 @@
  * ┌─────────────────────────────────────────────────────────────┐
  * │  在架构中的位置：Storage Layer（存储层）                    │
  * │  被谁调用：ReindexService（写入）、ConnectionsService（读取）│
- * │  参见：ARCHITECTURE.md「三、核心数据结构 → NoteMeta」       │
+ * │  参见：docs/ARCHITECTURE.md「三、核心数据结构 → NoteMeta」  │
  * └─────────────────────────────────────────────────────────────┘
  *
  * 负责管理 vault 中所有已索引笔记的 NoteMeta 元数据。

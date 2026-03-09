@@ -68,6 +68,11 @@
 - 每篇笔记中与当前笔记**最契合的一段文字**
 - 标题、路径、相似度、最佳片段摘要
 
+当前默认行为：
+
+- 插件启动时会自动打开右侧 `Connections View`
+- 用户也可以在设置页关闭“启动时打开关联视图”
+
 ### 2. Lookup View
 用户输入自然语言查询后：
 
@@ -87,7 +92,7 @@
 - note / chunk embedding
 - 最佳 passage 选取
 - 增量索引（create / modify / delete / rename）
-- 索引持久化（index-store.json 快照，启动加载 + 增量防抖保存）
+- 索引持久化（`index-store.json` 元数据快照 + `index-vectors.bin` 向量二进制，启动加载 + 增量防抖保存）
 - 错误日志系统（容量上限 + 时间过期双重清理）
 - 三种 Embedding Provider（mock / local / remote）
 - 设置页（provider 选择、API 配置、模型列表检测、测试连接、排除文件夹、索引管理）
@@ -246,11 +251,6 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
   - 支持 bge-small-zh-v1.5、bge-base-zh-v1.5、bge-large-zh-v1.5 等预置模型
   - 可选量化精度（Q8/Q4/FP16/FP32）
   - 懒加载，首次 embed 时才下载模型，后续从本地缓存加载
-- `remote-provider.ts`
-  - 远程 Embedding Provider（OpenAI 兼容 API）
-  - 支持批量请求、自动重试与指数退避（429/5xx）
-  - 动态维度检测（适配不同模型）
-  - 兼容 Azure、Together.ai、本地部署等服务
 - `embedding-service.ts`
   - provider 调度层
 
@@ -288,7 +288,7 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 2. 简要总结当前结构
 3. 给出最小实现计划
 4. 分小步实现
-5. 如遇到实际问题/踩坑/异常，记录到 `TROUBLESHOOTING.md`
+5. 如遇到实际问题/踩坑/异常，记录到 `docs/TROUBLESHOOTING.md`
 6. 说明改了哪些文件
 7. 给出手动验证步骤
 
@@ -297,7 +297,7 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 本项目约定：**所有在 Obsidian 实际运行中遇到的“问题 → 根因 → 修复”都要沉淀为可检索的文档**，避免同类问题重复踩坑，并为后续迭代提供决策依据。
 
 #### 记录位置
-- 统一记录在 `TROUBLESHOOTING.md`
+- 统一记录在 `docs/TROUBLESHOOTING.md`
 
 #### 何时必须记录
 - 插件在 Obsidian 中出现报错/异常行为（尤其是“提示失败但原因不明”）
@@ -316,7 +316,7 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 - 状态（已修复/待验证/已知限制/待优化）
 
 #### 与代码改动的配套原则
-- 修复完成后，确保文档与代码一致：涉及架构变更时同步更新 `ARCHITECTURE.md`；涉及用户使用方式变更时同步更新 `README.md`
+- 修复完成后，确保文档与代码一致：涉及架构变更时同步更新 `docs/ARCHITECTURE.md`；涉及用户使用方式变更时同步更新 `README.md`
 
 ### Claude 不应做的事
 - 不要一次性重写整个项目

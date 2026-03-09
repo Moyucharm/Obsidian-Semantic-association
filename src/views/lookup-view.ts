@@ -34,7 +34,7 @@ export class LookupView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return "Semantic Search";
+		return "语义搜索";
 	}
 
 	getIcon(): string {

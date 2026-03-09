@@ -6,7 +6,7 @@
  * │  被谁调用：                                                       │
  * │    - main.ts 直接调用 indexAll()（全量索引）                       │
  * │    - ReindexQueue 通过 executor 调用 processTask()（增量索引）     │
- * │  参见：ARCHITECTURE.md「五、索引流程」                             │
+ * │  参见：docs/ARCHITECTURE.md「五、索引流程」                        │
  * └───────────────────────────────────────────────────────────────────┘
  *
  * 这是索引层的「编排者」，串联所有组件完成索引流程：
@@ -174,7 +174,7 @@ export class ReindexService {
 
 		// ── 步骤 5：批量生成 chunk embedding ──
 		// 将所有 chunk 的文本提取出来，一次性发送给 EmbeddingService
-		// 批量调用比逐条调用效率高（RemoteProvider 支持 batch API）
+		// 批量调用比逐条调用效率高，也能保持 provider 端的统一批处理入口。
 		const chunkTexts = chunks.map((c) => c.text);
 		const chunkVectors = await this.embeddingService.embedBatch(chunkTexts);
 

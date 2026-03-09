@@ -5,7 +5,7 @@
  * │  在架构中的位置：Storage Layer（存储层）                        │
  * │  被谁调用：ReindexService（写入）、PassageSelector（读取）      │
  * │           ConnectionsService（读取）、LookupService（读取）     │
- * │  参见：ARCHITECTURE.md「三、核心数据结构 → ChunkMeta」          │
+ * │  参见：docs/ARCHITECTURE.md「三、核心数据结构 → ChunkMeta」     │
  * └─────────────────────────────────────────────────────────────────┘
  *
  * 负责管理所有 chunk（语义块）的元数据。一篇笔记会被 Chunker 切分为

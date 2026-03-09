@@ -84,6 +84,7 @@ export class LocalProvider implements EmbeddingProvider {
 	private allowRemoteModels: boolean;
 	private readonly workerScriptPath: string;
 	private readonly webWorkerScriptPath: string;
+	private readonly preferFileSystemCache: boolean;
 	private readonly onProgress?: (progress: LocalModelProgress) => void;
 	private readonly onRuntimeEvent?: (event: LocalProviderRuntimeEvent) => void;
 
@@ -110,6 +111,7 @@ export class LocalProvider implements EmbeddingProvider {
 		this.allowRemoteModels = config.allowRemoteModels ?? false;
 		this.workerScriptPath = config.workerScriptPath;
 		this.webWorkerScriptPath = config.webWorkerScriptPath;
+		this.preferFileSystemCache = config.preferFileSystemCache ?? false;
 		this.onProgress = config.onProgress;
 		this.onRuntimeEvent = config.onRuntimeEvent;
 	}
@@ -309,8 +311,9 @@ export class LocalProvider implements EmbeddingProvider {
 				let webWorkerFallbackError: Error | null = null;
 				const browserWorkerAvailable = this.canUseWebWorker();
 
-				// 优先尝试 Web Worker（浏览器标准 API），再降级 inline
-				if (browserWorkerAvailable) {
+				// 优先尝试 Web Worker（浏览器标准 API），再降级 inline。
+				// 若要求固定到插件目录，则跳过 Web Worker。
+				if (browserWorkerAvailable && !this.preferFileSystemCache) {
 					try {
 						await this.ensureWebWorkerReady();
 						return;
@@ -331,11 +334,18 @@ export class LocalProvider implements EmbeddingProvider {
 					workerStartError,
 					webWorkerFallbackError,
 					browserWorkerAvailable
-						? undefined
+						? this.preferFileSystemCache
+							? [
+									"web_worker_skipped=true",
+									"web_worker_skip_reason=prefer_file_system_cache",
+									`cache_path=${this.cachePath}`,
+								]
+							: undefined
 						: [
 								this.webWorkerScriptPath
 									? "web_worker_api_available=false"
 									: "web_worker_script_path=missing",
+								`cache_path=${this.cachePath}`,
 							],
 				);
 				await this.ensureInlineReady();
@@ -349,7 +359,11 @@ export class LocalProvider implements EmbeddingProvider {
 		this.reportRuntimeMode("worker", {
 			level: "info",
 			message: "Local model runtime is using worker_threads.",
-			details: [`worker_script_path=${this.workerScriptPath}`],
+			details: [
+				`worker_script_path=${this.workerScriptPath}`,
+				`cache_path=${this.cachePath}`,
+				"model_storage=plugin-dir",
+			],
 		});
 		this.worker = worker;
 		worker.on("message", this.handleWorkerMessage);
@@ -395,7 +409,7 @@ export class LocalProvider implements EmbeddingProvider {
 		this.reportRuntimeMode("web-worker", {
 			level: "info",
 			message: "Local model runtime is using Web Worker (browser Worker API).",
-			details: this.webWorkerLaunchDetails,
+			details: [...this.webWorkerLaunchDetails, "model_storage=browser-cache"],
 		});
 
 		webWorker.onmessage = (event: MessageEvent) => {
@@ -860,6 +874,8 @@ export class LocalProvider implements EmbeddingProvider {
 					webWorkerDiagnostic?.message
 						? `web_worker_fallback_message=${webWorkerDiagnostic.message}`
 						: undefined,
+					`cache_path=${this.cachePath}`,
+					"model_storage=plugin-dir",
 				].filter((item): item is string => Boolean(item)),
 			),
 		});

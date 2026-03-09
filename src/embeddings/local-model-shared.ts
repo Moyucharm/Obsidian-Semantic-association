@@ -11,23 +11,23 @@ export interface LocalModelInfo {
 export const SUPPORTED_LOCAL_MODELS: LocalModelInfo[] = [
 	{
 		id: "Xenova/bge-small-zh-v1.5",
-		name: "bge-small-zh-v1.5 (Chinese, 512d)",
+		name: "bge-small-zh-v1.5（中文，512 维）",
 		dimension: 512,
-		description: "Lightweight Chinese model with fast inference.",
+		description: "轻量级中文模型，推理速度快。",
 		sizeHints: { fp32: "~95MB", fp16: "~48MB", q8: "~24MB", q4: "~52MB" },
 	},
 	{
 		id: "Xenova/bge-base-zh-v1.5",
-		name: "bge-base-zh-v1.5 (Chinese, 768d)",
+		name: "bge-base-zh-v1.5（中文，768 维）",
 		dimension: 768,
-		description: "Balanced Chinese model recommended for general use.",
+		description: "均衡型中文模型，适合通用场景，推荐使用。",
 		sizeHints: { fp32: "~407MB", fp16: "~204MB", q8: "~102MB", q4: "~120MB" },
 	},
 	{
 		id: "Xenova/bge-large-zh-v1.5",
-		name: "bge-large-zh-v1.5 (Chinese, 1024d)",
+		name: "bge-large-zh-v1.5（中文，1024 维）",
 		dimension: 1024,
-		description: "Largest Chinese model with the best quality and slower inference.",
+		description: "高精度中文模型，效果最好，但推理速度较慢。",
 		sizeHints: { fp32: "~1.3GB", fp16: "~650MB", q8: "~326MB", q4: "~279MB" },
 	},
 ];
@@ -61,6 +61,7 @@ export interface LocalProviderRuntimeEvent {
 export interface LocalProviderConfig extends LocalRuntimeConfig {
 	workerScriptPath: string;
 	webWorkerScriptPath: string;
+	preferFileSystemCache?: boolean;
 	onProgress?: (progress: LocalModelProgress) => void;
 	onRuntimeEvent?: (event: LocalProviderRuntimeEvent) => void;
 }

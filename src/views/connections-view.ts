@@ -35,7 +35,7 @@ export class ConnectionsView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return "Semantic Connections";
+		return "语义关联";
 	}
 
 	getIcon(): string {

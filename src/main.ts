@@ -11,6 +11,8 @@ import { Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 import {
 	SemanticConnectionsSettings,
 	DEFAULT_SETTINGS,
+	type LocalDtype,
+	type IndexStorageSummary,
 	type IndexErrorEntry,
 	type RebuildIndexProgress,
 	type RuntimeLogCategory,
@@ -57,6 +59,8 @@ type RebuildIndexOptions = {
 	onProgress?: (progress: RebuildIndexProgress) => void;
 };
 
+const LOCAL_DTYPES: LocalDtype[] = ["fp32", "fp16", "q8", "q4"];
+
 export default class SemanticConnectionsPlugin extends Plugin {
 	settings: SemanticConnectionsSettings = DEFAULT_SETTINGS;
 
@@ -67,6 +71,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	// Store 持久化
 	private indexSnapshotPath: string = "";
+	private indexVectorSnapshotPath: string = "";
 	private indexSaveTimer: ReturnType<typeof setTimeout> | null = null;
 	private indexSaveInProgress: Promise<void> | null = null;
 	private indexSavePending = false;
@@ -121,6 +126,14 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		});
 
 		this.addCommand({
+			id: "show-index-storage-summary",
+			name: "显示索引统计",
+			callback: () => {
+				void this.showIndexStorageSummary();
+			},
+		});
+
+		this.addCommand({
 			id: "clean-local-model-cache",
 			name: "清理旧本地模型缓存",
 			callback: () => this.cleanOldLocalModelCache(),
@@ -163,12 +176,67 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	/** 加载设置 */
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const raw = (await this.loadData()) as Partial<SemanticConnectionsSettings> &
+			Record<string, unknown> | null;
+		const loaded = raw ?? {};
+		const storedEmbeddingProvider =
+			typeof loaded["embeddingProvider"] === "string"
+				? String(loaded["embeddingProvider"])
+				: undefined;
+		const embeddingProvider =
+			storedEmbeddingProvider === "mock" || storedEmbeddingProvider === "local"
+				? storedEmbeddingProvider
+				: DEFAULT_SETTINGS.embeddingProvider;
+		const excludedFolders = Array.isArray(loaded.excludedFolders)
+			? loaded.excludedFolders.filter((folder): folder is string => typeof folder === "string")
+			: DEFAULT_SETTINGS.excludedFolders;
+		const localDtype = LOCAL_DTYPES.includes(loaded.localDtype as LocalDtype)
+			? (loaded.localDtype as LocalDtype)
+			: DEFAULT_SETTINGS.localDtype;
+
+		this.settings = {
+			maxConnections:
+				typeof loaded.maxConnections === "number"
+					? loaded.maxConnections
+					: DEFAULT_SETTINGS.maxConnections,
+			excludedFolders,
+			embeddingProvider,
+			autoIndex:
+				typeof loaded.autoIndex === "boolean"
+					? loaded.autoIndex
+					: DEFAULT_SETTINGS.autoIndex,
+			autoOpenConnectionsView:
+				typeof loaded.autoOpenConnectionsView === "boolean"
+					? loaded.autoOpenConnectionsView
+					: DEFAULT_SETTINGS.autoOpenConnectionsView,
+			localModelId:
+				typeof loaded.localModelId === "string" && loaded.localModelId.trim().length > 0
+					? loaded.localModelId
+					: DEFAULT_SETTINGS.localModelId,
+			localDtype,
+			forcePluginLocalModelStorage:
+				typeof loaded.forcePluginLocalModelStorage === "boolean"
+					? loaded.forcePluginLocalModelStorage
+					: DEFAULT_SETTINGS.forcePluginLocalModelStorage,
+		};
 	}
 
 	/** 保存设置 */
-	async saveSettings(): Promise<void> {
-		await this.saveData(this.settings);
+	async saveSettings(context: string = "settings"): Promise<void> {
+		try {
+			await this.saveData(this.settings);
+		} catch (error) {
+			console.error("Semantic Connections: failed to save settings", context, error);
+			if (this.errorLogger) {
+				await this.logRuntimeError("save-settings", error, {
+					stage: "settings-save",
+					errorType: "configuration",
+					filePath: `__settings__/${context}`,
+					details: [`context=${context}`],
+				});
+			}
+			throw error;
+		}
 	}
 
 	async logRuntimeError(
@@ -216,7 +284,42 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	}
 
 	async clearRuntimeLogs(): Promise<void> {
-		await this.runtimeLogger.clear();
+		try {
+			await this.runtimeLogger.clear();
+			if (this.runtimeLogger.isDirty) {
+				throw new Error("Runtime log clear was not persisted.");
+			}
+		} catch (error) {
+			await this.logRuntimeError("clear-runtime-logs", error, {
+				stage: "runtime-log-clear",
+				errorType: "storage",
+				filePath: "__runtime__/runtime-log",
+			});
+			throw error;
+		}
+	}
+
+	async clearErrorLogs(): Promise<void> {
+		try {
+			await this.errorLogger.clear();
+			if (this.errorLogger.isDirty) {
+				throw new Error("Error log clear was not persisted.");
+			}
+		} catch (error) {
+			await this.logRuntimeEvent(
+				"error-log-clear-failed",
+				"错误日志清空失败，请检查插件目录写入权限。",
+				{
+					level: "warn",
+					category: "storage",
+					details: [
+						"log=error",
+						error instanceof Error ? `cause=${error.message}` : `cause=${String(error)}`,
+					],
+				},
+			);
+			throw error;
+		}
 	}
 
 	private registerGlobalErrorHandlers(): void {
@@ -278,6 +381,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	 */
 	private createServices(): void {
 		this.indexSnapshotPath = this.getPluginDataPath("index-store.json");
+		this.indexVectorSnapshotPath = this.getPluginDataPath("index-vectors.bin");
 
 		// 错误日志
 		const logPath = this.getPluginDataPath("error-log.json");
@@ -363,7 +467,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		await this.runtimeLogger.cleanupIfNeeded();
 		await this.logRuntimeEvent(
 			"startup-sequence-started",
-			"Plugin startup sequence reached layout-ready.",
+			"插件启动流程已进入 layout-ready 阶段。",
 			{
 				category: "lifecycle",
 			},
@@ -375,22 +479,27 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		// 注册文件变更事件（增量索引）
 		this.registerFileEvents();
+		if (this.settings.autoOpenConnectionsView) {
+			await this.ensureViewOpen(VIEW_TYPE_CONNECTIONS);
+			await this.logRuntimeEvent(
+				"connections-view-auto-opened",
+				"启动时已自动打开关联视图。",
+				{
+					category: "lifecycle",
+				},
+			);
+		}
 
 		// 检查是否需要全量索引
 		if (this.noteStore.size === 0) {
-			// 索引快照存在但与当前 Embedding 配置不兼容时，不自动重建（避免意外触发远程 API 成本）
+			// 索引快照存在但与当前 Embedding 配置不兼容时，不自动重建，避免产生意外结果。
 			if (this.indexSnapshotIncompatible) {
 				new Notice("索引与当前 Embedding 配置不兼容，请手动执行「重建索引」。", 8000);
-			} else if (
-				this.settings.embeddingProvider === "remote" &&
-				!this.settings.remoteApiKey
-			) {
-				new Notice("已选择远程 Embedding，但未配置 API Key。请先在设置中填写，然后执行「重建索引」。", 8000);
 			} else if (this.settings.embeddingProvider === "local") {
 				new Notice("当前使用本地模型且索引为空。请先在设置页点击“下载本地模型”，再手动执行“重建索引”。", 8000);
 				await this.logRuntimeEvent(
 					"startup-auto-rebuild-skipped",
-					"Skipped startup auto rebuild because local model download must be user-initiated.",
+					"已跳过启动时自动重建，因为本地模型下载需要用户手动触发。",
 					{
 						category: "lifecycle",
 						provider: "local",
@@ -403,7 +512,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			}
 		}
 
-		await this.logRuntimeEvent("plugin-ready", "Plugin startup completed.", {
+		await this.logRuntimeEvent("plugin-ready", "插件启动完成。", {
 			category: "lifecycle",
 		});
 		console.log("Semantic Connections: ready");
@@ -513,8 +622,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	 * 激活指定类型的视图
 	 * 如果已存在则聚焦，否则在右侧创建新叶子
 	 */
-	async activateView(viewType: string): Promise<void> {
+	private async ensureViewOpen(viewType: string, options?: { reveal?: boolean }): Promise<void> {
 		const { workspace } = this.app;
+		const reveal = options?.reveal ?? false;
 
 		let leaf: WorkspaceLeaf | null = null;
 		const leaves = workspace.getLeavesOfType(viewType);
@@ -527,9 +637,13 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			}
 		}
 
-		if (leaf) {
+		if (leaf && reveal) {
 			workspace.revealLeaf(leaf);
 		}
+	}
+
+	async activateView(viewType: string): Promise<void> {
+		await this.ensureViewOpen(viewType, { reveal: true });
 	}
 
 	/**
@@ -554,7 +668,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		const notice = new Notice("正在构建语义索引...", 0);
 
 		try {
-			await this.logRuntimeEvent("rebuild-index-started", "Started full index rebuild.", {
+			await this.logRuntimeEvent("rebuild-index-started", "已开始全量重建索引。", {
 				category: "indexing",
 			});
 			// 清空旧错误日志：新一轮重建后日志应只包含本次结果
@@ -662,7 +776,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				notice.setMessage(message);
 				await this.logRuntimeEvent(
 					"rebuild-index-finished",
-					"Full index rebuild completed with partial failures.",
+					"全量重建索引完成，但有部分失败。",
 					{
 						category: "indexing",
 						details: [
@@ -685,7 +799,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				notice.setMessage(message);
 				await this.logRuntimeEvent(
 					"rebuild-index-finished",
-					"Full index rebuild completed successfully.",
+					"全量重建索引完成。",
 					{
 						category: "indexing",
 						details: [
@@ -726,6 +840,112 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		return `${this.app.vault.configDir}/plugins/${this.manifest.id}/${filename}`;
 	}
 
+	private formatByteSize(bytes: number): string {
+		if (!Number.isFinite(bytes) || bytes <= 0) {
+			return "0 B";
+		}
+
+		const units = ["B", "KB", "MB", "GB"];
+		let value = bytes;
+		let unitIndex = 0;
+		while (value >= 1024 && unitIndex < units.length - 1) {
+			value /= 1024;
+			unitIndex++;
+		}
+
+		return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+	}
+
+	async getIndexStorageSummary(): Promise<IndexStorageSummary> {
+		const adapter = this.app.vault.adapter;
+		const breakdown = this.vectorStore.getBreakdown();
+		const jsonStat = this.indexSnapshotPath
+			? await adapter.stat(this.indexSnapshotPath).catch(() => null)
+			: null;
+		const binaryStat = this.indexVectorSnapshotPath
+			? await adapter.stat(this.indexVectorSnapshotPath).catch(() => null)
+			: null;
+		const rawParts = [
+			jsonStat?.type === "file"
+				? {
+					label: "index-store.json",
+					path: this.indexSnapshotPath,
+					bytes: jsonStat.size,
+				}
+				: undefined,
+			binaryStat?.type === "file"
+				? {
+					label: "index-vectors.bin",
+					path: this.indexVectorSnapshotPath,
+					bytes: binaryStat.size,
+				}
+				: undefined,
+		].filter(
+			(part): part is { label: string; path: string; bytes: number } => Boolean(part),
+		);
+		const totalBytes = rawParts.reduce((sum, part) => sum + part.bytes, 0);
+		const parts = rawParts.map((part) => ({
+			...part,
+			share: totalBytes > 0 ? part.bytes / totalBytes : 0,
+		}));
+
+		return {
+			noteCount: this.noteStore.size,
+			chunkCount: this.chunkStore.size,
+			vectorCount: breakdown.vectorCount,
+			noteVectorCount: breakdown.noteVectorCount,
+			chunkVectorCount: breakdown.chunkVectorCount,
+			embeddingDimension: breakdown.dimension,
+			snapshotFormat:
+				binaryStat?.type === "file"
+					? "json+binary"
+					: jsonStat?.type === "file"
+						? "json-only"
+						: "missing",
+			parts,
+			totalBytes,
+		};
+	}
+
+	async showIndexStorageSummary(): Promise<void> {
+		try {
+		const summary = await this.getIndexStorageSummary();
+		const lines = [
+			`索引统计：${summary.noteCount} 篇笔记，${summary.chunkCount} 个语义块，${summary.vectorCount} 个向量`,
+			`向量细分：note=${summary.noteVectorCount}，chunk=${summary.chunkVectorCount}，dimension=${summary.embeddingDimension}`,
+			`快照格式：${summary.snapshotFormat}`,
+		];
+
+		if (summary.parts.length > 0) {
+			lines.push(
+				`总占用：${this.formatByteSize(summary.totalBytes)}`,
+				...summary.parts.flatMap((part) => [
+					`${part.label}: ${this.formatByteSize(part.bytes)} (${(part.share * 100).toFixed(1)}%)`,
+					`路径：${part.path}`,
+				]),
+			);
+		} else {
+			lines.push("尚未检测到已落盘的索引快照文件。");
+		}
+
+		new Notice(lines.join("\n"), 12000);
+		console.info("Semantic Connections index storage summary\n" + lines.join("\n"));
+		} catch (error) {
+			new Notice("读取索引存储统计失败，请查看错误日志。", 6000);
+			await this.logRuntimeError("show-index-storage-summary", error, {
+				stage: "index-storage-summary",
+				errorType: "storage",
+				filePath: this.indexSnapshotPath || "__plugin__/index-storage-summary",
+				details: [
+					this.indexVectorSnapshotPath
+						? `vector_binary_path=${this.indexVectorSnapshotPath}`
+						: undefined,
+				].filter((item): item is string => Boolean(item)),
+			});
+			console.error("Semantic Connections: failed to show index storage summary", error);
+		}
+	}
+
 	private async loadIndexSnapshot(): Promise<void> {
 		if (!this.indexSnapshotPath) return;
 
@@ -738,17 +958,27 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				savedAt?: number;
 				embeddingProvider?: string;
 				embeddingDimension?: number;
-				remoteModel?: string;
 				localModelId?: string;
 				localDtype?: string;
+				vectorBinaryPath?: string;
 				noteStore?: unknown;
 				chunkStore?: unknown;
 				vectorStore?: unknown;
 			};
 
-			if (!snapshot || typeof snapshot !== "object") return;
-			if (snapshot.version !== 1) return;
-			if (!snapshot.noteStore || !snapshot.chunkStore || !snapshot.vectorStore) return;
+			if (!snapshot || typeof snapshot !== "object") {
+				throw new Error("Index snapshot payload is invalid.");
+			}
+			if (snapshot.version !== 1 && snapshot.version !== 2) {
+				throw new Error(`Unsupported index snapshot version: ${String(snapshot.version)}`);
+			}
+			const missingStores = ["noteStore", "chunkStore", "vectorStore"].filter((key) => {
+				const value = snapshot[key as keyof typeof snapshot];
+				return value === undefined || value === null;
+			});
+			if (missingStores.length > 0) {
+				throw new Error(`Index snapshot is incomplete: ${missingStores.join(", ")}`);
+			}
 
 			// 快照与当前 embedding 配置不兼容时，拒绝加载，避免产生“随机召回”等异常结果
 			const providerMismatch =
@@ -756,18 +986,14 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				snapshot.embeddingProvider !== this.settings.embeddingProvider;
 
 			const modelMismatch =
-				this.settings.embeddingProvider === "remote"
-					? snapshot.remoteModel &&
-						snapshot.remoteModel !== this.settings.remoteModel
-					: this.settings.embeddingProvider === "local"
-						? (snapshot.localModelId &&
-								snapshot.localModelId !== this.settings.localModelId) ||
-							(snapshot.localDtype &&
-								snapshot.localDtype !== this.settings.localDtype)
-						: false;
+				this.settings.embeddingProvider === "local"
+					? (snapshot.localModelId &&
+							snapshot.localModelId !== this.settings.localModelId) ||
+						(snapshot.localDtype &&
+							snapshot.localDtype !== this.settings.localDtype)
+					: false;
 
 			const dimensionMismatch =
-				this.settings.embeddingProvider !== "remote" &&
 				typeof snapshot.embeddingDimension === "number" &&
 				snapshot.embeddingDimension > 0 &&
 				this.embeddingService.dimension > 0 &&
@@ -784,10 +1010,22 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 			this.noteStore.load(snapshot.noteStore);
 			this.chunkStore.load(snapshot.chunkStore);
-			this.vectorStore.load(snapshot.vectorStore);
+			if (snapshot.version === 2) {
+				const vectorBinaryPath =
+					typeof snapshot.vectorBinaryPath === "string" && snapshot.vectorBinaryPath.length > 0
+						? snapshot.vectorBinaryPath
+						: this.indexVectorSnapshotPath;
+				if (!(await this.app.vault.adapter.exists(vectorBinaryPath))) {
+					throw new Error(`Vector snapshot binary is missing: ${vectorBinaryPath}`);
+				}
+				const binary = await this.app.vault.adapter.readBinary(vectorBinaryPath);
+				this.vectorStore.loadBinary(snapshot.vectorStore, binary);
+			} else {
+				this.vectorStore.load(snapshot.vectorStore);
+			}
 			await this.logRuntimeEvent(
 				"index-snapshot-loaded",
-				"Index snapshot restored from disk.",
+				"已从磁盘恢复索引快照。",
 				{
 					category: "storage",
 					details: [
@@ -815,52 +1053,64 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	}
 
 	private async saveIndexSnapshot(): Promise<void> {
-		if (!this.indexSnapshotPath) return;
+		if (!this.indexSnapshotPath || !this.indexVectorSnapshotPath) return;
 
-		const snapshot = {
-			version: 1,
-			savedAt: Date.now(),
-			embeddingProvider: this.settings.embeddingProvider,
-			embeddingDimension: this.embeddingService.dimension,
-			remoteModel:
-				this.settings.embeddingProvider === "remote"
-					? this.settings.remoteModel
-					: undefined,
-			localModelId:
-				this.settings.embeddingProvider === "local"
-					? this.settings.localModelId
-					: undefined,
-			localDtype:
-				this.settings.embeddingProvider === "local"
-					? this.settings.localDtype
-					: undefined,
-			noteStore: this.noteStore.serialize(),
-			chunkStore: this.chunkStore.serialize(),
-			vectorStore: this.vectorStore.serialize(),
+		const replaceTextFile = async (path: string, contents: string): Promise<void> => {
+			const tmpPath = path + ".tmp";
+			await this.app.vault.adapter.write(tmpPath, contents);
+			try {
+				await this.app.vault.adapter.rename(tmpPath, path);
+			} catch {
+				if (await this.app.vault.adapter.exists(path)) {
+					await this.app.vault.adapter.remove(path);
+				}
+				await this.app.vault.adapter.rename(tmpPath, path);
+			}
+		};
+
+		const replaceBinaryFile = async (path: string, contents: ArrayBuffer): Promise<void> => {
+			const tmpPath = path + ".tmp";
+			await this.app.vault.adapter.writeBinary(tmpPath, contents);
+			try {
+				await this.app.vault.adapter.rename(tmpPath, path);
+			} catch {
+				if (await this.app.vault.adapter.exists(path)) {
+					await this.app.vault.adapter.remove(path);
+				}
+				await this.app.vault.adapter.rename(tmpPath, path);
+			}
 		};
 
 		try {
-			// 不做 pretty print：VectorStore 可能很大，避免额外的磁盘占用
-			const serialized = JSON.stringify(snapshot);
+			const vectorSnapshot = this.vectorStore.serializeBinary();
+			const snapshot = {
+				version: 2,
+				savedAt: Date.now(),
+				embeddingProvider: this.settings.embeddingProvider,
+				embeddingDimension: this.embeddingService.dimension,
+				localModelId:
+					this.settings.embeddingProvider === "local"
+						? this.settings.localModelId
+						: undefined,
+				localDtype:
+					this.settings.embeddingProvider === "local"
+						? this.settings.localDtype
+						: undefined,
+				vectorBinaryPath: this.indexVectorSnapshotPath,
+				noteStore: this.noteStore.serialize(),
+				chunkStore: this.chunkStore.serialize(),
+				vectorStore: vectorSnapshot.metadata,
+			};
 
-			// 尽量用“临时文件 + rename”降低写入中断导致 JSON 损坏的概率
-			const tmpPath = this.indexSnapshotPath + ".tmp";
-			await this.app.vault.adapter.write(tmpPath, serialized);
-
-			try {
-				await this.app.vault.adapter.rename(tmpPath, this.indexSnapshotPath);
-			} catch {
-				// 部分 adapter 不允许覆盖已存在文件：先删除再 rename
-				if (await this.app.vault.adapter.exists(this.indexSnapshotPath)) {
-					await this.app.vault.adapter.remove(this.indexSnapshotPath);
-				}
-				await this.app.vault.adapter.rename(tmpPath, this.indexSnapshotPath);
-			}
+			const serialized = JSON.stringify(snapshot, null, 2);
+			await replaceBinaryFile(this.indexVectorSnapshotPath, vectorSnapshot.buffer);
+			await replaceTextFile(this.indexSnapshotPath, serialized);
 		} catch (err) {
 			await this.logRuntimeError("save-index-snapshot", err, {
 				stage: "index-snapshot-save",
 				errorType: "storage",
 				filePath: this.indexSnapshotPath,
+				details: [`vector_binary_path=${this.indexVectorSnapshotPath}`],
 			});
 			console.error("Semantic Connections: failed to save index snapshot", err);
 		}
@@ -915,6 +1165,13 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					await adapter.rmdir(folder, true);
 					removed++;
 				} catch (error) {
+					await this.logRuntimeError("clean-old-local-model-cache-silent-item", error, {
+						stage: "local-cache-cleanup-silent:item",
+						errorType: "storage",
+						filePath: folder,
+						provider: "local",
+						details: [`folder=${folder}`],
+					});
 					console.warn("Semantic Connections: failed to remove old cache folder", folder, error);
 				}
 			}
@@ -922,7 +1179,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			if (removed > 0) {
 				await this.logRuntimeEvent(
 					"old-local-model-cache-cleaned",
-					"Removed stale local model cache directories during startup.",
+					"启动时已清理旧版本本地模型缓存目录。",
 					{
 						category: "storage",
 						provider: "local",
@@ -959,6 +1216,13 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					await adapter.rmdir(folder, true);
 					removedFolders++;
 				} catch (err) {
+					await this.logRuntimeError("clean-old-local-model-cache-item", err, {
+						stage: "local-cache-cleanup:item",
+						errorType: "storage",
+						filePath: folder,
+						provider: "local",
+						details: [`folder=${folder}`],
+					});
 					console.warn("Semantic Connections: failed to remove cache folder", folder, err);
 				}
 			}
@@ -969,7 +1233,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				notice.setMessage(`清理完成：移除 ${removedFolders} 个旧缓存目录。`);
 				await this.logRuntimeEvent(
 					"old-local-model-cache-cleaned",
-					"Removed stale local model cache directories via command.",
+					"已通过命令清理旧版本本地模型缓存目录。",
 					{
 						category: "storage",
 						provider: "local",
@@ -980,6 +1244,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			setTimeout(() => notice.hide(), 3000);
 		} catch (err) {
 			notice.setMessage("清理失败，请查看控制台。");
+			notice.setMessage("清理失败，请查看错误日志。");
 			await this.logRuntimeError("clean-old-local-model-cache", err, {
 				stage: "local-cache-cleanup",
 				errorType: "storage",

@@ -30,7 +30,6 @@
 │   EmbeddingService → 统一调用入口            │
 │   MockProvider     → 内部开发/兜底伪向量     │
 │   LocalProvider    → 本地 Transformers.js    │
-│   RemoteProvider   → OpenAI 兼容 API         │
 ├──────────────────────────────────────────────┤
 │             Storage Layer（存储层）           │
 │   NoteStore   → 笔记元数据                   │
@@ -84,6 +83,22 @@
 
 `VectorStore` 在加载快照、写入向量和执行搜索前都会校验维度一致性。若快照损坏或维度不一致，系统会拒绝继续使用该快照，避免静默返回错误结果。
 
+### 索引快照落盘
+
+当前快照格式已拆成两部分：
+
+- `index-store.json`：保存 note/chunk 元数据、embedding 配置和向量二进制元信息；按多行 JSON 写入，便于人工排查。
+- `index-vectors.bin`：保存全部向量主体，格式为连续的 `float32 little-endian` 二进制数据，避免把大批向量数组直接塞进 JSON。
+- 启动时同时兼容旧版 `version: 1` 的单文件 JSON 快照；下一次保存快照或重建索引后会自动迁移成 `json+binary`。
+- 设置页“查看统计”和命令“显示索引统计”会展示 note/chunk/vector 数量、快照格式、文件体积和占比。
+
+默认文件位置：
+
+```
+{vault}/.obsidian/plugins/semantic-connections/index-store.json
+{vault}/.obsidian/plugins/semantic-connections/index-vectors.bin
+```
+
 ---
 
 ## 四、插件启动流程
@@ -98,7 +113,7 @@ onload()
  │     ├─ RuntimeLogger（运行日志，持久化到 runtime-log.json）
  │     ├─ NoteStore / ChunkStore / VectorStore
  │     ├─ Scanner / Chunker
- │     ├─ EmbeddingService → 根据设置选 LocalProvider / RemoteProvider，必要时降级到 MockProvider
+ │     ├─ EmbeddingService → 根据设置选 LocalProvider 或 MockProvider
  │     ├─ ReindexService（串联 Scanner→Chunker→Embedding→Storage + ErrorLogger）
  │     ├─ ReindexQueue（设置执行器为 ReindexService.processTask）
  │     ├─ ConnectionsService
@@ -266,10 +281,11 @@ rebuildIndex()
 ├─ 模型文件缓存在插件数据目录（.obsidian/plugins/.../models/）
 ├─ 缓存目录采用版本化命名：cache-v{LOCAL_MODEL_CACHE_VERSION}-tf{TRANSFORMERS_JS_VERSION}
 ├─ 首次使用需从 HuggingFace Hub 下载模型（约 80-200MB）
-├─ 设置页支持“下载”“清理缓存并重下”“测试本地模型”
+├─ 设置页支持“下载”“清理缓存并重下”“仅清理缓存”“测试本地模型”
 ├─ “下载”只做 prepare：下载缺失文件 + 初始化会话 + 预热；“测试本地模型”才执行真实测试推理
 ├─ 支持下载进度回调（Notice 和设置页状态区都会展示）
 ├─ 下载状态区会区分单文件完成（done）与整体就绪（ready / warmup / success）
+├─ 设置页可开启“固定到插件目录”：开启后跳过 Web Worker 浏览器缓存，优先落盘到插件目录 `models/`
 ├─ 设置页进度条只会在实际进入 download / progress / done 后推进，ready / warmup 仅更新文案
 ├─ 设置页“下载”使用独立的临时 LocalProvider/worker，不与共享 provider 争用运行时或进度监听
 ├─ LocalProvider 在主线程仅作为代理，运行时降级链为三级：
@@ -279,7 +295,10 @@ rebuildIndex()
 ├─ Web Worker 入口为 `src/workers/local-model-web-worker.ts`，构建后产物为 `local-model-web-worker.js`（IIFE 格式）
 ├─ Web Worker 启动时优先把本地脚本转成 `blob:` URL，绕过 `app://obsidian.md` 对 `file://` Worker 的跨源限制
 ├─ 若 Blob Worker 不可用，才回落到 `file://` URL
+├─ 若最终运行模式为 `worker` 或 `inline`，模型文件会落在 `{vault}/.obsidian/plugins/semantic-connections/models/cache-v{LOCAL_MODEL_CACHE_VERSION}-tf{TRANSFORMERS_JS_VERSION}`
 ├─ Web Worker 模式下模型缓存走浏览器 Cache API（非文件系统），Transformers.js 原生支持
+├─ “仅清理缓存” / “清理缓存并重下”会同时尝试删除插件目录缓存和 `transformers-cache` 浏览器缓存
+├─ 可通过 `runtime-log.json` 中的 `local-runtime-mode-selected` 查看当前实际模式
 ├─ Node Worker 入口为 `src/workers/local-model-worker.ts`，构建后产物为 `local-model-worker.js`
 ├─ 插件启动时会自动清理旧版本本地模型缓存
 └─ 完全离线运行，无 API 费用
@@ -294,38 +313,6 @@ rebuildIndex()
 | Xenova/bge-large-zh-v1.5 | 1024 | ~326MB | 中文高精度，模型较大 |
 
 用户可在设置页选择量化精度（Q8/Q4/FP16/FP32），默认 Q8（最佳的大小与精度平衡）。
-
-### RemoteProvider（生产使用）
-
-调用 OpenAI 兼容的 `/v1/embeddings` 接口：
-
-```
-特性：
-├─ 按 batchSize 分片请求（默认 100 条/次）
-├─ 429（rate limit）/ 5xx 自动退避重试（最多 3 次）
-├─ 使用 Obsidian 的 requestUrl（绕过 CORS 限制）
-├─ 可配置 Base URL（支持 OpenAI / Azure / 其他兼容服务）
-├─ 支持通过 GET /models 自动检测可用的 embedding 模型
-└─ 严格校验返回条数、index 连续性、向量维度和数值合法性
-```
-
-### 模型列表检测
-
-`RemoteProvider.fetchModels()` 静态方法调用 `GET {apiUrl}/models` 端点，获取 API 支持的模型列表：
-
-```
-fetchModels(apiUrl, apiKey)
-  → GET {apiUrl}/models
-  → 过滤：保留 id 包含 "embed" 的模型
-  → 若无匹配：返回全部模型（兼容非标准命名）
-  → 按 id 字母序排列
-```
-
-设置页通过 `EmbeddingService.fetchAvailableModels()` 调用，结果缓存在 `SettingTab` 实例中。
-
-切换方式：在设置页选择 Provider 类型，从下拉列表选择模型或手动输入。
-
----
 
 ## 八、文件清单
 
@@ -355,7 +342,6 @@ src/
 │   ├── local-model-shared.ts        本地模型共享类型（LocalModelInfo / LocalProviderConfig）
 │   ├── local-runtime.ts             本地推理核心逻辑（Worker / inline 共用）
 │   ├── local-worker-protocol.ts     Worker 消息协议（Node Worker / Web Worker 共用）
-│   ├── remote-provider.ts           OpenAI 兼容 API（批量 + 重试 + 响应校验）
 │   ├── embedding-service.ts         Provider 调度层
 │   └── index.ts
 │
@@ -430,13 +416,13 @@ workers/（构建入口，产物在项目根目录）
 
 | errorType | 含义 | 典型场景 |
 |-----------|------|----------|
-| embedding | Embedding API 调用失败 | 网络错误、API Key 无效、速率限制 |
+| embedding | Embedding 调用失败 | 本地模型初始化失败、推理异常 |
 | scanning  | 文件读取 / 元数据提取失败 | 文件被锁定、编码错误 |
 | chunking  | 文本切分异常 | 特殊格式导致 Chunker 异常 |
 | storage   | 存储写入失败 | 内存不足、数据格式异常 |
 | query     | 查询执行失败 | Connections / Lookup 查询异常 |
 | runtime   | 插件运行时异常 | 启动失败、未处理异常、快照恢复失败 |
-| configuration | 配置或设置相关失败 | 远程模型列表获取失败、设置页操作失败 |
+| configuration | 配置或设置相关失败 | 设置页操作失败、配置不兼容 |
 | unknown   | 无法分类 | 其他未预期的错误 |
 
 ### 清理策略
@@ -464,7 +450,6 @@ workers/（构建入口，产物在项目根目录）
 - 索引快照加载 / 保存失败
 - 旧本地模型缓存清理失败或部分删除失败
 - `ConnectionsView` / `LookupView` 查询失败
-- 设置页远程模型列表获取失败
 - `window.error` 与 `unhandledrejection` 中可归因到本插件的异常
 - `ErrorLogger.load()` 自身失败时的自诊断记录
 
@@ -526,8 +511,6 @@ workers/（构建入口，产物在项目根目录）
 | `local-model-download-ready` / `local-model-download-warmup` | 模型文件已齐备并开始初始化 / 已进入预热 |
 | `local-model-ready` | 设置页本地模型 prepare 成功 |
 | `local-model-test-ok` | 设置页本地模型测试成功 |
-| `remote-model-list-fetched` | 远程模型列表获取成功 |
-| `remote-connection-test-ok` | 远程 API 测试成功 |
 
 ### 清理策略
 

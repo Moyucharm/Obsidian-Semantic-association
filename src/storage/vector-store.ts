@@ -8,7 +8,7 @@
  * │    读取：ConnectionsService（note-level 粗筛）                      │
  * │         LookupService（chunk-level 搜索）                           │
  * │         PassageSelector（获取候选 chunk 向量做比较）                 │
- * │  参见：ARCHITECTURE.md「三、核心数据结构 → VectorStore」             │
+ * │  参见：docs/ARCHITECTURE.md「三、核心数据结构 → VectorStore」        │
  * └──────────────────────────────────────────────────────────────────────┘
  *
  * 负责存储所有向量数据，并提供最近邻搜索能力。
@@ -68,7 +68,23 @@ interface VectorStoreData {
 	dimension: number;
 }
 
+export interface VectorStoreBinaryMetadata {
+	version: number;
+	encoding: "float32-le";
+	dimension: number;
+	vectorCount: number;
+	ids: string[];
+}
+
+export interface VectorStoreBreakdown {
+	vectorCount: number;
+	noteVectorCount: number;
+	chunkVectorCount: number;
+	dimension: number;
+}
+
 const CURRENT_VERSION = 1;
+const CURRENT_BINARY_VERSION = 2;
 
 /** 搜索结果项：id + 相似度分数 */
 export interface VectorSearchResult {
@@ -137,6 +153,110 @@ export class VectorStore {
 			vectors[id] = vec;
 		}
 		return { version: CURRENT_VERSION, vectors, dimension: this.dimension };
+	}
+
+	serializeBinary(): { metadata: VectorStoreBinaryMetadata; buffer: ArrayBuffer } {
+		const ids = Array.from(this.vectors.keys());
+		const buffer = new ArrayBuffer(ids.length * this.dimension * 4);
+		const view = new DataView(buffer);
+		let byteOffset = 0;
+
+		for (const id of ids) {
+			const vector = this.vectors.get(id);
+			if (!vector) {
+				throw new Error(`VectorStore: missing vector for ${id} during binary serialization`);
+			}
+
+			for (const value of vector) {
+				view.setFloat32(byteOffset, value, true);
+				byteOffset += 4;
+			}
+		}
+
+		return {
+			metadata: {
+				version: CURRENT_BINARY_VERSION,
+				encoding: "float32-le",
+				dimension: this.dimension,
+				vectorCount: ids.length,
+				ids,
+			},
+			buffer,
+		};
+	}
+
+	loadBinary(raw: unknown, binary: ArrayBuffer): void {
+		this.clear();
+
+		if (!raw || typeof raw !== "object") {
+			throw new Error("VectorStore: invalid binary metadata");
+		}
+
+		const metadata = raw as VectorStoreBinaryMetadata;
+		if (
+			metadata.version !== CURRENT_BINARY_VERSION ||
+			metadata.encoding !== "float32-le" ||
+			!Array.isArray(metadata.ids)
+		) {
+			throw new Error("VectorStore: unsupported binary metadata");
+		}
+
+		if (!Number.isInteger(metadata.dimension) || metadata.dimension < 0) {
+			throw new Error("VectorStore: invalid binary metadata dimension");
+		}
+
+		if (!Number.isInteger(metadata.vectorCount) || metadata.vectorCount < 0) {
+			throw new Error("VectorStore: invalid binary metadata vector count");
+		}
+
+		if (metadata.ids.length !== metadata.vectorCount) {
+			throw new Error("VectorStore: binary metadata ids/vectorCount mismatch");
+		}
+
+		const expectedBytes = metadata.vectorCount * metadata.dimension * 4;
+		if (binary.byteLength !== expectedBytes) {
+			throw new Error(
+				`VectorStore: binary snapshot size mismatch, expected ${expectedBytes}, got ${binary.byteLength}`,
+			);
+		}
+
+		const view = new DataView(binary);
+		let byteOffset = 0;
+
+		for (const id of metadata.ids) {
+			if (typeof id !== "string" || id.length === 0) {
+				throw new Error("VectorStore: invalid vector id in binary metadata");
+			}
+
+			const vector = new Array<number>(metadata.dimension);
+			for (let i = 0; i < metadata.dimension; i++) {
+				vector[i] = view.getFloat32(byteOffset, true);
+				byteOffset += 4;
+			}
+			this.vectors.set(id, this.validateVector(vector, id, metadata.dimension));
+		}
+
+		this.dimension = metadata.vectorCount > 0 ? metadata.dimension : 0;
+	}
+
+	getBreakdown(): VectorStoreBreakdown {
+		let noteVectorCount = 0;
+		let chunkVectorCount = 0;
+
+		for (const id of this.vectors.keys()) {
+			if (id.includes("#")) {
+				chunkVectorCount++;
+			} else {
+				noteVectorCount++;
+			}
+		}
+
+		return {
+			vectorCount: this.vectors.size,
+			noteVectorCount,
+			chunkVectorCount,
+			dimension: this.dimension,
+		};
 	}
 
 	/**
