@@ -74,17 +74,26 @@
  * 4. 切换 provider 后需要重建索引（因为新旧 provider 维度可能不同）
  */
 
-import type { Vector, RemoteModelInfo } from "../types";
+import type { ErrorDiagnostic, Vector, RemoteModelInfo } from "../types";
 import type { SemanticConnectionsSettings } from "../types";
+import { normalizeErrorDiagnostic } from "../utils/error-utils";
 import type { EmbeddingProvider } from "./provider";
 import { MockProvider } from "./mock-provider";
 import { RemoteProvider } from "./remote-provider";
 import { LocalProvider, SUPPORTED_LOCAL_MODELS } from "./local-provider";
-import type { LocalModelProgress } from "./local-provider";
+import type { LocalModelProgress, LocalProviderRuntimeEvent } from "./local-provider";
 
 // 本地模型缓存版本：当 Transformers.js 升级或缓存结构变更时手动递增
 const LOCAL_MODEL_CACHE_VERSION = 2;
 const TRANSFORMERS_JS_VERSION = "3.8.1";
+
+type ServiceOperationFailure = {
+	ok: false;
+	error: string;
+	diagnostic: ErrorDiagnostic;
+};
+
+type ServiceOperationSuccess<T> = { ok: true } & T;
 
 export class EmbeddingService {
 	/**
@@ -97,9 +106,13 @@ export class EmbeddingService {
 
 	/** 插件数据目录路径（用于 LocalProvider 的模型缓存） */
 	private pluginDataPath: string;
+	private pluginBasePath: string;
+	private localWorkerScriptPath: string;
+	private localWebWorkerScriptPath: string;
 
-	/** 模型下载/加载进度监听器（由 main.ts 在 rebuildIndex 时设置） */
-	private progressListener?: (progress: LocalModelProgress) => void;
+	/** 模型下载/加载进度监听器 */
+	private readonly progressListeners = new Set<(progress: LocalModelProgress) => void>();
+	private localRuntimeEventListener?: (event: LocalProviderRuntimeEvent) => void;
 
 	/**
 	 * @param settings - 插件全局设置
@@ -111,8 +124,16 @@ export class EmbeddingService {
 	constructor(
 		private settings: SemanticConnectionsSettings,
 		pluginDataPath: string = "",
+		pluginBasePath: string = "",
+		localWorkerScriptPath: string = "",
+		localWebWorkerScriptPath: string = "",
+		localRuntimeEventListener?: (event: LocalProviderRuntimeEvent) => void,
 	) {
 		this.pluginDataPath = pluginDataPath;
+		this.pluginBasePath = pluginBasePath;
+		this.localWorkerScriptPath = localWorkerScriptPath;
+		this.localWebWorkerScriptPath = localWebWorkerScriptPath;
+		this.localRuntimeEventListener = localRuntimeEventListener;
 		this.provider = this.createProvider(settings);
 	}
 
@@ -122,6 +143,15 @@ export class EmbeddingService {
 			? `${this.pluginDataPath}/models`
 			: "./models";
 		return `${base}/cache-v${LOCAL_MODEL_CACHE_VERSION}-tf${TRANSFORMERS_JS_VERSION}`;
+	}
+
+	getAbsoluteLocalModelCachePath(): string {
+		const relativeCachePath = this.getLocalModelCachePath().replace(/\//g, "\\");
+		if (!this.pluginBasePath) {
+			return relativeCachePath;
+		}
+
+		return `${this.pluginBasePath}\\models\\cache-v${LOCAL_MODEL_CACHE_VERSION}-tf${TRANSFORMERS_JS_VERSION}`;
 	}
 
 	/**
@@ -191,6 +221,17 @@ export class EmbeddingService {
 	}
 
 	/**
+	 * 显式释放当前 provider 资源。
+	 *
+	 * 主要用于删除当前本地模型缓存前，先断开已加载的本地模型会话。
+	 */
+	async disposeCurrentProvider(): Promise<void> {
+		if (this.provider.dispose) {
+			await this.provider.dispose();
+		}
+	}
+
+	/**
 	 * 测试当前 provider 的连接是否正常
 	 *
 	 * 发送一条短文本进行 embed 请求，验证 API 配置（Key / URL / Model）是否有效。
@@ -199,12 +240,75 @@ export class EmbeddingService {
 	 *
 	 * @returns 成功时返回维度信息，失败时返回错误描述
 	 */
-	async testConnection(): Promise<{ ok: true; dimension: number } | { ok: false; error: string }> {
+	async testConnection(): Promise<
+		ServiceOperationSuccess<{ dimension: number }> | ServiceOperationFailure
+	> {
 		try {
 			const vec = await this.provider.embed("connection test");
 			return { ok: true, dimension: vec.length };
 		} catch (err) {
-			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+			return this.buildFailureResult(err);
+		}
+	}
+
+	/**
+	 * 准备当前本地模型：
+	 * - 下载缺失模型文件
+	 * - 初始化推理会话
+	 * - 返回最终向量维度
+	 *
+	 * 与 testConnection() 的区别是：这里不会再额外执行一次测试 embedding，
+	 * 因此更适合作为设置页“下载”按钮的实际动作。
+	 */
+	async prepareLocalModel(): Promise<
+		ServiceOperationSuccess<{ dimension: number }> | ServiceOperationFailure
+	>;
+	async prepareLocalModel(options: {
+		progressListener?: (progress: LocalModelProgress) => void;
+	}): Promise<ServiceOperationSuccess<{ dimension: number }> | ServiceOperationFailure>;
+	async prepareLocalModel(options?: {
+		progressListener?: (progress: LocalModelProgress) => void;
+	}): Promise<ServiceOperationSuccess<{ dimension: number }> | ServiceOperationFailure> {
+		if (this.settings.embeddingProvider !== "local") {
+			return this.buildFailureResult({
+				message: "当前 provider 不是本地模型",
+				code: "ERR_PROVIDER_NOT_LOCAL",
+				stage: "provider-selection",
+			});
+		}
+
+		const temporaryProvider = this.createLocalProvider({
+			allowRemoteModels: true,
+			onProgress: options?.progressListener,
+			broadcastProgress: false,
+		});
+
+		try {
+			const dimension = await temporaryProvider.downloadAndPrepare();
+			return { ok: true, dimension };
+		} catch (err) {
+			return this.buildFailureResult(err);
+		} finally {
+			await temporaryProvider.dispose().catch(() => undefined);
+		}
+	}
+
+	async ensureLocalModelReady(): Promise<
+		ServiceOperationSuccess<{ dimension: number }> | ServiceOperationFailure
+	> {
+		if (!(this.provider instanceof LocalProvider)) {
+			return this.buildFailureResult({
+				message: "当前 provider 不是本地模型",
+				code: "ERR_PROVIDER_NOT_LOCAL",
+				stage: "provider-selection",
+			});
+		}
+
+		try {
+			const dimension = await this.provider.prepare();
+			return { ok: true, dimension };
+		} catch (err) {
+			return this.buildFailureResult(err);
 		}
 	}
 
@@ -220,7 +324,8 @@ export class EmbeddingService {
 	 * @returns 成功时返回模型列表，失败时返回错误信息
 	 */
 	async fetchAvailableModels(): Promise<
-		{ ok: true; models: RemoteModelInfo[] } | { ok: false; error: string }
+		| { ok: true; models: RemoteModelInfo[] }
+		| { ok: false; error: string; diagnostic?: ErrorDiagnostic }
 	> {
 		if (this.settings.embeddingProvider !== "remote") {
 			return { ok: false, error: "当前非远程模式" };
@@ -236,7 +341,12 @@ export class EmbeddingService {
 			);
 			return { ok: true, models };
 		} catch (err) {
-			return { ok: false, error: err instanceof Error ? err.message : String(err) };
+			const diagnostic = normalizeErrorDiagnostic(err);
+			return {
+				ok: false,
+				error: diagnostic.message,
+				diagnostic,
+			};
 		}
 	}
 
@@ -248,8 +358,50 @@ export class EmbeddingService {
 	 *
 	 * @param fn - 进度回调，传入 undefined 清除监听
 	 */
-	setProgressListener(fn: ((progress: LocalModelProgress) => void) | undefined): void {
-		this.progressListener = fn;
+	addProgressListener(fn: (progress: LocalModelProgress) => void): () => void {
+		this.progressListeners.add(fn);
+		return () => {
+			this.progressListeners.delete(fn);
+		};
+	}
+
+	private buildFailureResult(error: unknown): ServiceOperationFailure {
+		const diagnostic = normalizeErrorDiagnostic(error);
+		return {
+			ok: false,
+			error: diagnostic.message,
+			diagnostic,
+		};
+	}
+
+	private emitProgress(progress: LocalModelProgress): void {
+		for (const listener of Array.from(this.progressListeners)) {
+			listener(progress);
+		}
+	}
+
+	private createLocalProvider(options?: {
+		allowRemoteModels?: boolean;
+		onProgress?: (progress: LocalModelProgress) => void;
+		broadcastProgress?: boolean;
+	}): LocalProvider {
+		const modelInfo = SUPPORTED_LOCAL_MODELS.find((m) => m.id === this.settings.localModelId);
+		return new LocalProvider({
+			modelId: this.settings.localModelId,
+			dimension: modelInfo?.dimension ?? 384,
+			cachePath: this.getAbsoluteLocalModelCachePath(),
+			dtype: this.settings.localDtype,
+			allowRemoteModels: options?.allowRemoteModels ?? false,
+			workerScriptPath: this.localWorkerScriptPath,
+			webWorkerScriptPath: this.localWebWorkerScriptPath,
+			onProgress: (info) => {
+				if (options?.broadcastProgress ?? true) {
+					this.emitProgress(info);
+				}
+				options?.onProgress?.(info);
+			},
+			onRuntimeEvent: (event) => this.localRuntimeEventListener?.(event),
+		});
 	}
 
 	/**
@@ -275,18 +427,8 @@ export class EmbeddingService {
 					model: settings.remoteModel,
 					batchSize: settings.remoteBatchSize,
 				});
-			case "local": {
-				const modelInfo = SUPPORTED_LOCAL_MODELS.find(
-					(m) => m.id === settings.localModelId,
-				);
-				return new LocalProvider({
-					modelId: settings.localModelId,
-					dimension: modelInfo?.dimension ?? 384,
-					cachePath: this.getLocalModelCachePath(),
-					dtype: settings.localDtype,
-					onProgress: (info) => this.progressListener?.(info),
-				});
-			}
+			case "local":
+				return this.createLocalProvider();
 			case "mock":
 			default:
 				// default 降级到 mock：即使 settings 中出现未知值也不会崩溃

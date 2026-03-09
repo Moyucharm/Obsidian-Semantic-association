@@ -106,6 +106,7 @@ export class ReindexService {
 		const files = this.scanner.getMarkdownFiles(excludedFolders);
 		const total = files.length;
 		let failed = 0;
+		onProgress?.(0, total);
 
 		// 逐个文件索引（不用 Promise.all 并行，因为 embedding API 有速率限制）
 		for (let i = 0; i < files.length; i++) {

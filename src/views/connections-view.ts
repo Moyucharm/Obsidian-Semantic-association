@@ -20,6 +20,7 @@ export class ConnectionsView extends ItemView {
 	private plugin: SemanticConnectionsPlugin;
 	/** 防止重复渲染的标记 */
 	private currentNotePath: string = "";
+	private refreshRequestId = 0;
 	private scheduleRefresh = debounce((force: boolean = false) => {
 		void this.refreshView(force);
 	}, 300);
@@ -64,6 +65,7 @@ export class ConnectionsView extends ItemView {
 
 	async onClose(): Promise<void> {
 		this.currentNotePath = "";
+		this.refreshRequestId++;
 	}
 
 	/**
@@ -75,6 +77,7 @@ export class ConnectionsView extends ItemView {
 
 		// 无活动文件或非 md 文件
 		if (!file || file.extension !== "md") {
+			this.refreshRequestId++;
 			this.renderEmpty("打开一篇笔记以查看语义关联");
 			this.currentNotePath = "";
 			return;
@@ -83,6 +86,7 @@ export class ConnectionsView extends ItemView {
 		// 避免重复查询同一文件
 		if (!force && file.path === this.currentNotePath) return;
 		this.currentNotePath = file.path;
+		const requestId = ++this.refreshRequestId;
 
 		// 检查索引状态
 		if (this.plugin.noteStore.size === 0) {
@@ -97,6 +101,7 @@ export class ConnectionsView extends ItemView {
 				file.path,
 				this.plugin.settings.maxConnections,
 			);
+			if (this.isStaleRequest(requestId, file.path)) return;
 
 			if (results.length === 0) {
 				this.renderEmpty("暂未找到相关笔记");
@@ -104,9 +109,26 @@ export class ConnectionsView extends ItemView {
 				this.renderResults(results);
 			}
 		} catch (err) {
+			if (this.isStaleRequest(requestId, file.path)) return;
 			console.error("ConnectionsView: query failed", err);
+			await this.plugin.logRuntimeError("connections-query", err, {
+				errorType: "query",
+				filePath: file.path,
+				details: [
+					`force_refresh=${force}`,
+					`max_results=${this.plugin.settings.maxConnections}`,
+				],
+			});
 			this.renderEmpty("查询失败，请查看控制台");
 		}
+	}
+
+	private isStaleRequest(requestId: number, expectedPath: string): boolean {
+		if (requestId !== this.refreshRequestId) {
+			return true;
+		}
+		const activeFile = this.app.workspace.getActiveFile();
+		return !activeFile || activeFile.path !== expectedPath;
 	}
 
 	/** 渲染空状态 */

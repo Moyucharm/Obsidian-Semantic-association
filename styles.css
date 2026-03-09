@@ -176,3 +176,94 @@
 	color: var(--text-error);
 	background: rgba(var(--background-modifier-error-rgb), 0.1);
 }
+
+/* 本地模型下载状态 */
+.sc-local-download-status {
+	margin-top: 8px;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-secondary);
+}
+
+.sc-local-download-status.is-success {
+	border-color: var(--text-success, #4caf50);
+}
+
+.sc-local-download-status.is-error {
+	border-color: var(--text-error);
+}
+
+.sc-local-download-progress {
+	height: 6px;
+	border-radius: 999px;
+	background: var(--background-modifier-border);
+	overflow: hidden;
+}
+
+.sc-local-download-progress-bar {
+	width: 0;
+	height: 100%;
+	background: var(--interactive-accent);
+	transition: width 150ms ease;
+}
+
+.sc-local-download-detail {
+	margin-top: 6px;
+	font-size: 0.82em;
+	color: var(--text-muted);
+	word-break: break-all;
+}
+
+.sc-log-output {
+	margin-top: 8px;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-secondary);
+	font-family: var(--font-monospace);
+	font-size: 0.8em;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 240px;
+	overflow: auto;
+}
+
+/* 重建索引状态 */
+.sc-rebuild-status {
+	margin-top: 8px;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-secondary);
+}
+
+.sc-rebuild-status.is-success {
+	border-color: var(--text-success, #4caf50);
+}
+
+.sc-rebuild-status.is-error {
+	border-color: var(--text-error);
+}
+
+.sc-rebuild-progress {
+	height: 6px;
+	border-radius: 999px;
+	background: var(--background-modifier-border);
+	overflow: hidden;
+}
+
+.sc-rebuild-progress-bar {
+	width: 0;
+	height: 100%;
+	background: var(--interactive-accent);
+	transition: width 150ms ease;
+}
+
+.sc-rebuild-detail {
+	margin-top: 6px;
+	font-size: 0.82em;
+	color: var(--text-muted);
+	word-break: break-word;
+}

@@ -8,6 +8,46 @@
 /** 向量类型：固定长度的浮点数组 */
 export type Vector = number[];
 
+/** 可持久化的错误诊断信息 */
+export interface ErrorDiagnostic {
+	message: string;
+	name?: string;
+	code?: string;
+	stage?: string;
+	stack?: string;
+	details?: string[];
+}
+
+/** 运行日志级别 */
+export type RuntimeLogLevel = "info" | "warn";
+
+/** 运行日志分类 */
+export type RuntimeLogCategory =
+	| "lifecycle"
+	| "indexing"
+	| "embedding"
+	| "storage"
+	| "configuration"
+	| "query";
+
+/** 运行日志条目 */
+export interface RuntimeLogEntry {
+	/** 事件发生时间（ms since epoch） */
+	timestamp: number;
+	/** 事件标识 */
+	event: string;
+	/** 日志级别 */
+	level: RuntimeLogLevel;
+	/** 事件分类 */
+	category: RuntimeLogCategory;
+	/** 事件说明 */
+	message: string;
+	/** 当前使用的 embedding provider */
+	provider?: string;
+	/** 可用于排查的附加上下文标签 */
+	details?: string[];
+}
+
 /** 本地模型量化精度，对应 Transformers.js 的 ONNX 文件变体 */
 export type LocalDtype = "fp32" | "fp16" | "q8" | "q4";
 
@@ -135,17 +175,37 @@ export interface SemanticConnectionsSettings {
  * 索引错误日志条目
  * 记录单次索引失败的详细信息，用于事后诊断
  */
+export type ErrorLogType =
+	| "embedding"
+	| "scanning"
+	| "chunking"
+	| "storage"
+	| "query"
+	| "runtime"
+	| "configuration"
+	| "unknown";
+
 export interface IndexErrorEntry {
 	/** 错误发生时间（ms since epoch） */
 	timestamp: number;
 	/** 失败的文件路径 */
 	filePath: string;
 	/** 错误类型分类 */
-	errorType: "embedding" | "scanning" | "chunking" | "storage" | "unknown";
+	errorType: ErrorLogType;
 	/** 错误详细信息 */
 	message: string;
 	/** 使用的 embedding provider */
 	provider?: string;
+	/** 错误类名，如 TypeError / Error */
+	errorName?: string;
+	/** 错误代码，如 ERR_LOCAL_WORKER_EXIT */
+	errorCode?: string;
+	/** 错误发生阶段，如 warmup / worker-start */
+	stage?: string;
+	/** 原始 stack，用于详细诊断 */
+	stack?: string;
+	/** 可用于排查的附加上下文标签 */
+	details?: string[];
 }
 
 /**
@@ -163,6 +223,27 @@ export interface IndexSummary {
  * 远程 API 返回的模型信息
  * 用于设置页的模型下拉选择框
  */
+export type RebuildIndexStage =
+	| "checking-local-model"
+	| "model-download"
+	| "model-ready"
+	| "model-warmup"
+	| "indexing"
+	| "saving"
+	| "success"
+	| "error";
+
+export interface RebuildIndexProgress {
+	stage: RebuildIndexStage;
+	message: string;
+	done?: number;
+	total?: number;
+	percent?: number;
+	file?: string;
+	failed?: number;
+	indexedNotes?: number;
+}
+
 export interface RemoteModelInfo {
 	/** 模型 ID（如 "text-embedding-3-small"） */
 	id: string;
@@ -174,7 +255,7 @@ export interface RemoteModelInfo {
 export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	maxConnections: 20,
 	excludedFolders: [],
-	embeddingProvider: "mock",
+	embeddingProvider: "local",
 	autoIndex: true,
 	remoteApiKey: "",
 	remoteApiUrl: "https://api.openai.com/v1",

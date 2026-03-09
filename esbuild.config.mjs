@@ -10,26 +10,8 @@ if you want to view the source, please visit the github repository
 `;
 
 const prod = process.argv[2] === "production";
-
-/** 需要复制到 dist/ 的部署文件 */
-const DIST_FILES = ["main.js", "manifest.json", "styles.css"];
-
-/** 构建完成后将部署文件复制到 dist/ 目录 */
-function copyToDist() {
-	mkdirSync("dist", { recursive: true });
-	for (const file of DIST_FILES) {
-		try {
-			cpSync(file, `dist/${file}`);
-		} catch {
-			// styles.css 等文件可能不存在，静默跳过
-		}
-	}
-	console.log(`Copied to dist/: ${DIST_FILES.join(", ")}`);
-}
-
-const context = await esbuild.context({
+const sharedBuildOptions = {
 	banner: { js: banner },
-	entryPoints: ["src/main.ts"],
 	bundle: true,
 	external: [
 		"obsidian",
@@ -50,23 +32,73 @@ const context = await esbuild.context({
 		"sharp",
 		...builtins,
 	],
-	format: "cjs",
 	target: "es2020",
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	outfile: "main.js",
 	minify: prod,
 	// Transformers.js 在 ESM 中使用 import.meta.url，CJS 环境下需要兜底
 	define: {
 		"import.meta.url": JSON.stringify("file:///"),
 	},
-});
+};
+const buildTargets = [
+	{
+		entryPoints: ["src/main.ts"],
+		format: "cjs",
+		outfile: "main.js",
+	},
+	{
+		entryPoints: ["src/workers/local-model-worker.ts"],
+		format: "cjs",
+		outfile: "local-model-worker.js",
+	},
+	{
+		// Web Worker（浏览器标准 Worker API）
+		// IIFE 格式：所有依赖内联，无需 require()
+		// external 仅保留原生模块（Web Worker 不使用 Node.js builtins）
+		entryPoints: ["src/workers/local-model-web-worker.ts"],
+		format: "iife",
+		outfile: "local-model-web-worker.js",
+		external: ["onnxruntime-node", "sharp"],
+	},
+];
+
+/** 需要复制到 dist/ 的部署文件 */
+const DIST_FILES = ["main.js", "local-model-worker.js", "local-model-web-worker.js", "manifest.json", "styles.css"];
+
+/** 构建完成后将部署文件复制到 dist/ 目录 */
+function copyToDist() {
+	mkdirSync("dist", { recursive: true });
+	for (const file of DIST_FILES) {
+		try {
+			cpSync(file, `dist/${file}`);
+		} catch {
+			// styles.css 等文件可能不存在，静默跳过
+		}
+	}
+	console.log(`Copied to dist/: ${DIST_FILES.join(", ")}`);
+}
 
 if (prod) {
-	await context.rebuild();
+	await Promise.all(
+		buildTargets.map((target) =>
+			esbuild.build({
+				...sharedBuildOptions,
+				...target,
+			}),
+		),
+	);
 	copyToDist();
 	process.exit(0);
 } else {
-	await context.watch();
+	const contexts = await Promise.all(
+		buildTargets.map((target) =>
+			esbuild.context({
+				...sharedBuildOptions,
+				...target,
+			}),
+		),
+	);
+	await Promise.all(contexts.map((context) => context.watch()));
 }

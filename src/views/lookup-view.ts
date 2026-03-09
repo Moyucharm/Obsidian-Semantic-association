@@ -22,6 +22,7 @@ export class LookupView extends ItemView {
 	private searchInput: HTMLInputElement | null = null;
 	/** 结果容器引用 */
 	private resultsContainer: HTMLElement | null = null;
+	private searchRequestId = 0;
 
 	constructor(leaf: WorkspaceLeaf, plugin: SemanticConnectionsPlugin) {
 		super(leaf);
@@ -74,6 +75,7 @@ export class LookupView extends ItemView {
 	async onClose(): Promise<void> {
 		this.searchInput = null;
 		this.resultsContainer = null;
+		this.searchRequestId++;
 	}
 
 	/** 执行语义搜索 */
@@ -82,9 +84,11 @@ export class LookupView extends ItemView {
 		if (!this.resultsContainer) return;
 
 		if (!query) {
+			this.searchRequestId++;
 			this.resultsContainer.empty();
 			return;
 		}
+		const requestId = ++this.searchRequestId;
 
 		// 检查索引状态
 		if (this.plugin.noteStore.size === 0) {
@@ -99,6 +103,7 @@ export class LookupView extends ItemView {
 				query,
 				this.plugin.settings.maxConnections,
 			);
+			if (this.isStaleSearch(requestId, query)) return;
 
 			if (results.length === 0) {
 				this.renderMessage("未找到相关结果");
@@ -106,9 +111,25 @@ export class LookupView extends ItemView {
 				this.renderResults(results);
 			}
 		} catch (err) {
+			if (this.isStaleSearch(requestId, query)) return;
 			console.error("LookupView: search failed", err);
+			await this.plugin.logRuntimeError("lookup-search", err, {
+				errorType: "query",
+				details: [
+					`query_length=${query.length}`,
+					`max_results=${this.plugin.settings.maxConnections}`,
+				],
+			});
 			this.renderMessage("搜索失败，请查看控制台");
 		}
+	}
+
+	private isStaleSearch(requestId: number, expectedQuery: string): boolean {
+		if (requestId !== this.searchRequestId) {
+			return true;
+		}
+		const currentQuery = this.searchInput?.value?.trim() || "";
+		return currentQuery !== expectedQuery;
 	}
 
 	/** 渲染提示消息 */

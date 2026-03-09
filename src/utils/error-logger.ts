@@ -111,6 +111,18 @@ export class ErrorLogger {
 			console.warn("ErrorLogger: failed to load, starting fresh", err);
 			this.entries = [];
 			this.lastCleanup = 0;
+			this.log({
+				filePath: this.logPath,
+				errorType: "runtime",
+				message: "Failed to load persisted error log. A fresh log will be created.",
+				errorName: err instanceof Error ? err.name : undefined,
+				stack: err instanceof Error ? err.stack : undefined,
+				stage: "error-log-load",
+				details: [
+					`log_path=${this.logPath}`,
+					`cause=${err instanceof Error ? err.message : String(err)}`,
+				],
+			});
 		}
 	}
 

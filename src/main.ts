@@ -11,6 +11,11 @@ import { Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 import {
 	SemanticConnectionsSettings,
 	DEFAULT_SETTINGS,
+	type IndexErrorEntry,
+	type RebuildIndexProgress,
+	type RuntimeLogCategory,
+	type RuntimeLogEntry,
+	type RuntimeLogLevel,
 } from "./types";
 import { ConnectionsView, VIEW_TYPE_CONNECTIONS } from "./views/connections-view";
 import { LookupView, VIEW_TYPE_LOOKUP } from "./views/lookup-view";
@@ -26,6 +31,31 @@ import { EmbeddingService } from "./embeddings/embedding-service";
 import { ConnectionsService } from "./search/connections-service";
 import { LookupService } from "./search/lookup-service";
 import { ErrorLogger } from "./utils/error-logger";
+import { RuntimeLogger } from "./utils/runtime-logger";
+import { mergeErrorDetails, normalizeErrorDiagnostic } from "./utils/error-utils";
+import type {
+	LocalModelProgress,
+	LocalProviderRuntimeEvent,
+} from "./embeddings/local-model-shared";
+
+type RuntimeErrorLogOptions = {
+	errorType?: IndexErrorEntry["errorType"];
+	filePath?: string;
+	details?: string[];
+	provider?: string;
+	stage?: string;
+};
+
+type RuntimeEventLogOptions = {
+	level?: RuntimeLogLevel;
+	category?: RuntimeLogCategory;
+	details?: string[];
+	provider?: string;
+};
+
+type RebuildIndexOptions = {
+	onProgress?: (progress: RebuildIndexProgress) => void;
+};
 
 export default class SemanticConnectionsPlugin extends Plugin {
 	settings: SemanticConnectionsSettings = DEFAULT_SETTINGS;
@@ -57,6 +87,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	// 错误日志
 	errorLogger!: ErrorLogger;
+	runtimeLogger!: RuntimeLogger;
 
 	async onload(): Promise<void> {
 		// 加载用户设置
@@ -64,6 +95,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		// 初始化所有服务实例（轻量，不做计算）
 		this.createServices();
+		this.registerGlobalErrorHandlers();
 
 		// 注册视图
 		this.registerView(VIEW_TYPE_CONNECTIONS, (leaf) => new ConnectionsView(leaf, this));
@@ -99,7 +131,12 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		// layout-ready 后执行初始索引和注册文件事件
 		this.app.workspace.onLayoutReady(() => {
-			this.onLayoutReady();
+			void this.onLayoutReady().catch((error) => {
+				console.error("Semantic Connections: onLayoutReady failed", error);
+				void this.logRuntimeError("on-layout-ready", error, {
+					stage: "on-layout-ready",
+				});
+			});
 		});
 	}
 
@@ -120,6 +157,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		this.cancelIndexSaveTimer();
 		this.indexSavePending = true;
 		void this.flushIndexSave();
+		void this.runtimeLogger?.save();
+		void this.errorLogger?.save();
 	}
 
 	/** 加载设置 */
@@ -132,6 +171,107 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	async logRuntimeError(
+		operation: string,
+		error: unknown,
+		options: RuntimeErrorLogOptions = {},
+	): Promise<void> {
+		const diagnostic = normalizeErrorDiagnostic(error);
+		const provider = options.provider ?? this.settings.embeddingProvider;
+		const details = mergeErrorDetails(options.details, diagnostic.details, [
+			`operation=${operation}`,
+			`provider=${provider}`,
+		]);
+
+		await this.errorLogger.logAndSave({
+			filePath: options.filePath ?? `__plugin__/${operation}`,
+			errorType: options.errorType ?? "runtime",
+			message: diagnostic.message,
+			provider,
+			errorName: diagnostic.name,
+			errorCode: diagnostic.code,
+			stage: diagnostic.stage ?? options.stage,
+			stack: diagnostic.stack,
+			details,
+		});
+	}
+
+	async logRuntimeEvent(
+		event: string,
+		message: string,
+		options: RuntimeEventLogOptions = {},
+	): Promise<void> {
+		await this.runtimeLogger.logAndSave({
+			event,
+			level: options.level ?? "info",
+			category: options.category ?? "embedding",
+			message,
+			provider: options.provider ?? this.settings.embeddingProvider,
+			details: options.details,
+		});
+	}
+
+	getRecentRuntimeLogs(count: number = 50): RuntimeLogEntry[] {
+		return this.runtimeLogger.getRecent(count);
+	}
+
+	async clearRuntimeLogs(): Promise<void> {
+		await this.runtimeLogger.clear();
+	}
+
+	private registerGlobalErrorHandlers(): void {
+		if (typeof window === "undefined") {
+			return;
+		}
+
+		this.registerDomEvent(window, "error", (event: ErrorEvent) => {
+			if (!this.isPluginRelatedRuntimeValue(event.error ?? event.message ?? event.filename)) {
+				return;
+			}
+
+			void this.logRuntimeError("window-error", event.error ?? event.message, {
+				stage: "window-error",
+				details: [
+					event.filename ? `filename=${event.filename}` : undefined,
+					typeof event.lineno === "number" ? `line=${event.lineno}` : undefined,
+					typeof event.colno === "number" ? `column=${event.colno}` : undefined,
+				].filter((item): item is string => Boolean(item)),
+			});
+		});
+
+		this.registerDomEvent(window, "unhandledrejection", (event: PromiseRejectionEvent) => {
+			if (!this.isPluginRelatedRuntimeValue(event.reason)) {
+				return;
+			}
+
+			void this.logRuntimeError("unhandled-rejection", event.reason, {
+				stage: "unhandled-rejection",
+			});
+		});
+	}
+
+	private isPluginRelatedRuntimeValue(value: unknown): boolean {
+		const text =
+			value instanceof Error
+				? `${value.name} ${value.message} ${value.stack ?? ""}`
+				: typeof value === "string"
+					? value
+					: value && typeof value === "object"
+						? JSON.stringify(value)
+						: String(value ?? "");
+		const normalized = text.toLowerCase();
+		return [
+			"semantic connections",
+			"semantic-connections",
+			"local-model",
+			"embeddingservice",
+			"reindexservice",
+			"lookupview",
+			"connectionsview",
+			this.manifest.id.toLowerCase(),
+		].some((token) => normalized.includes(token));
+	}
+
 	/**
 	 * 创建所有服务实例
 	 * 只做实例化和依赖注入，不执行任何 IO 或计算
@@ -142,6 +282,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		// 错误日志
 		const logPath = this.getPluginDataPath("error-log.json");
 		this.errorLogger = new ErrorLogger(this.app.vault.adapter, logPath);
+		const runtimeLogPath = this.getPluginDataPath("runtime-log.json");
+		this.runtimeLogger = new RuntimeLogger(this.app.vault.adapter, runtimeLogPath);
 
 		// 存储层
 		this.noteStore = new NoteStore();
@@ -151,9 +293,24 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		// 索引层
 		this.scanner = new Scanner(this.app.vault, this.app.metadataCache);
 		this.chunker = new Chunker();
+		const adapterWithBasePath = this.app.vault.adapter as typeof this.app.vault.adapter & {
+			getBasePath?: () => string;
+		};
+		const vaultBasePath = adapterWithBasePath.getBasePath?.() ?? "";
+		const normalizedConfigDir = this.app.vault.configDir.replace(/\//g, "\\");
+		const pluginBasePath = vaultBasePath
+			? `${vaultBasePath.replace(/[\\/]+$/, "")}\\${normalizedConfigDir}\\plugins\\${this.manifest.id}`
+			: "";
+
 		this.embeddingService = new EmbeddingService(
 			this.settings,
 			`${this.app.vault.configDir}/plugins/${this.manifest.id}`,
+			pluginBasePath,
+			pluginBasePath ? `${pluginBasePath}\\local-model-worker.js` : "",
+			pluginBasePath ? `${pluginBasePath}\\local-model-web-worker.js` : "",
+			(event) => {
+				void this.handleLocalRuntimeEvent(event);
+			},
 		);
 
 		this.reindexService = new ReindexService(
@@ -202,6 +359,16 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		// 加载错误日志 + 月度清理（30 天前的条目自动删除）
 		await this.errorLogger.load();
 		await this.errorLogger.cleanupIfNeeded();
+		await this.runtimeLogger.load();
+		await this.runtimeLogger.cleanupIfNeeded();
+		await this.logRuntimeEvent(
+			"startup-sequence-started",
+			"Plugin startup sequence reached layout-ready.",
+			{
+				category: "lifecycle",
+			},
+		);
+		await this.cleanOldLocalModelCacheSilently();
 
 		// 尝试从磁盘恢复上次的索引（避免每次启动都全量重建）
 		await this.loadIndexSnapshot();
@@ -219,6 +386,16 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				!this.settings.remoteApiKey
 			) {
 				new Notice("已选择远程 Embedding，但未配置 API Key。请先在设置中填写，然后执行「重建索引」。", 8000);
+			} else if (this.settings.embeddingProvider === "local") {
+				new Notice("当前使用本地模型且索引为空。请先在设置页点击“下载本地模型”，再手动执行“重建索引”。", 8000);
+				await this.logRuntimeEvent(
+					"startup-auto-rebuild-skipped",
+					"Skipped startup auto rebuild because local model download must be user-initiated.",
+					{
+						category: "lifecycle",
+						provider: "local",
+					},
+				);
 			} else {
 				// mock 和 local 都可以直接开始索引
 				// local 会在首次 embed 时触发模型下载
@@ -226,7 +403,19 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			}
 		}
 
+		await this.logRuntimeEvent("plugin-ready", "Plugin startup completed.", {
+			category: "lifecycle",
+		});
 		console.log("Semantic Connections: ready");
+	}
+
+	private async handleLocalRuntimeEvent(event: LocalProviderRuntimeEvent): Promise<void> {
+		await this.logRuntimeEvent(event.event, event.message, {
+			level: event.level ?? "info",
+			category: "embedding",
+			provider: "local",
+			details: [`mode=${event.mode}`, ...(event.details ?? [])],
+		});
 	}
 
 	/**
@@ -352,16 +541,40 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	/** 是否正在执行全量重建（防止设置页按钮重复触发） */
 	isRebuilding = false;
 
-	async rebuildIndex(): Promise<void> {
+	async rebuildIndex(options?: RebuildIndexOptions): Promise<void> {
 		if (this.isRebuilding) return;
 		this.isRebuilding = true;
 		// 进入重建流程说明用户已明确要生成新索引
 		this.indexSnapshotIncompatible = false;
+		const emitProgress = (progress: RebuildIndexProgress): void => {
+			options?.onProgress?.(progress);
+		};
+		let removeProgressListener: (() => void) | undefined;
 
 		const notice = new Notice("正在构建语义索引...", 0);
 
 		try {
+			await this.logRuntimeEvent("rebuild-index-started", "Started full index rebuild.", {
+				category: "indexing",
+			});
 			// 清空旧错误日志：新一轮重建后日志应只包含本次结果
+			if (this.settings.embeddingProvider === "local") {
+				const checkingMessage = "正在检查本地模型状态...";
+				notice.setMessage(checkingMessage);
+				emitProgress({
+					stage: "checking-local-model",
+					message: checkingMessage,
+					percent: 0,
+				});
+
+				const localModelReady = await this.embeddingService.ensureLocalModelReady();
+				if (!localModelReady.ok) {
+					throw new Error(
+						`本地模型尚未就绪。请先在设置页点击“下载本地模型”。${localModelReady.error ? ` ${localModelReady.error}` : ""}`,
+					);
+				}
+			}
+
 			await this.errorLogger.clear();
 
 			// Full rebuild: clear existing index data first.
@@ -370,42 +583,140 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			this.vectorStore.clear();
 
 			// 设置模型下载进度监听（LocalProvider 首次加载时需要下载模型文件）
-			this.embeddingService.setProgressListener((info) => {
-				if (info.status === "progress" && info.file) {
-					notice.setMessage(
-						`正在下载模型: ${info.file} (${Math.round(info.progress ?? 0)}%)`,
-					);
-				} else if (info.status === "done") {
-					notice.setMessage("模型加载完成，开始构建索引...");
+			removeProgressListener = this.embeddingService.addProgressListener((info: LocalModelProgress) => {
+				if ((info.status === "download" || info.status === "progress") && info.file) {
+					const percent = Math.max(0, Math.round(info.progress ?? 0));
+					const message =
+						info.status === "progress"
+							? `正在下载本地模型：${info.file} (${percent}%)`
+							: `正在下载本地模型：${info.file}`;
+					emitProgress({
+						stage: "model-download",
+						message,
+						percent,
+						file: info.file,
+					});
+					notice.setMessage(message);
+					return;
+				}
+
+				if (info.status === "ready" || info.status === "done") {
+					const message = "本地模型已就绪，开始构建索引...";
+					emitProgress({
+						stage: "model-ready",
+						message,
+						percent: 100,
+					});
+					notice.setMessage(message);
+					return;
+				}
+
+				if (info.status === "warmup") {
+					const message = "正在预热本地模型...";
+					emitProgress({
+						stage: "model-warmup",
+						message,
+						percent: 100,
+					});
+					notice.setMessage(message);
 				}
 			});
 
 			const { total, failed } = await this.reindexService.indexAll(
 				this.settings.excludedFolders,
 				(done, total) => {
+					const percent = total > 0 ? Math.round((done / total) * 100) : 100;
+					const message =
+						total > 0
+							? `正在构建语义索引... (${done}/${total})`
+							: "未发现需要索引的笔记";
+					emitProgress({
+						stage: "indexing",
+						message,
+						done,
+						total,
+						percent,
+					});
 					notice.setMessage(`正在构建语义索引... (${done}/${total})`);
 				},
 			);
 
 			// 全量索引结束后落盘（即使部分文件失败，也保留已成功的结果）
+			emitProgress({
+				stage: "saving",
+				message: "正在保存索引到磁盘...",
+				percent: 100,
+			});
 			notice.setMessage("正在保存索引到磁盘...");
 			await this.saveIndexSnapshot();
 
 			if (failed > 0) {
-				notice.setMessage(
-					`索引完成：${this.noteStore.size} 篇笔记（${failed} 篇失败，详见错误日志）`,
+				const message = `索引完成：${this.noteStore.size} 篇笔记（${failed} 篇失败，详见错误日志）`;
+				emitProgress({
+					stage: "success",
+					message,
+					percent: 100,
+					failed,
+					indexedNotes: this.noteStore.size,
+				});
+				notice.setMessage(message);
+				await this.logRuntimeEvent(
+					"rebuild-index-finished",
+					"Full index rebuild completed with partial failures.",
+					{
+						category: "indexing",
+						details: [
+							`indexed_notes=${this.noteStore.size}`,
+							`failed=${failed}`,
+							`total=${total}`,
+						],
+					},
 				);
 				setTimeout(() => notice.hide(), 5000);
 			} else {
-				notice.setMessage(`索引完成：${this.noteStore.size} 篇笔记`);
+				const message = `索引完成：${this.noteStore.size} 篇笔记`;
+				emitProgress({
+					stage: "success",
+					message,
+					percent: 100,
+					failed: 0,
+					indexedNotes: this.noteStore.size,
+				});
+				notice.setMessage(message);
+				await this.logRuntimeEvent(
+					"rebuild-index-finished",
+					"Full index rebuild completed successfully.",
+					{
+						category: "indexing",
+						details: [
+							`indexed_notes=${this.noteStore.size}`,
+							`failed=0`,
+							`total=${total}`,
+						],
+					},
+				);
 				setTimeout(() => notice.hide(), 3000);
 			}
 		} catch (err) {
-			notice.setMessage("索引失败，请查看控制台");
+			const diagnostic = normalizeErrorDiagnostic(err);
+			const message = `重建索引失败：${diagnostic.message}`;
+			emitProgress({
+				stage: "error",
+				message,
+				percent: 0,
+			});
+			notice.setMessage(message);
 			console.error("Semantic Connections: rebuild index failed", err);
+			await this.logRuntimeEvent("rebuild-index-finished", message, {
+				level: "warn",
+				category: "indexing",
+			});
+			await this.logRuntimeError("rebuild-index", err, {
+				stage: diagnostic.stage ?? "rebuild-index",
+			});
 			setTimeout(() => notice.hide(), 5000);
 		} finally {
-			this.embeddingService.setProgressListener(undefined);
+			removeProgressListener?.();
 			this.isRebuilding = false;
 		}
 	}
@@ -474,11 +785,31 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			this.noteStore.load(snapshot.noteStore);
 			this.chunkStore.load(snapshot.chunkStore);
 			this.vectorStore.load(snapshot.vectorStore);
+			await this.logRuntimeEvent(
+				"index-snapshot-loaded",
+				"Index snapshot restored from disk.",
+				{
+					category: "storage",
+					details: [
+						`notes=${this.noteStore.size}`,
+						`chunks=${this.chunkStore.size}`,
+						`vectors=${this.vectorStore.size}`,
+					],
+				},
+			);
 
 			console.log(
 				`Semantic Connections: index loaded (notes=${this.noteStore.size}, chunks=${this.chunkStore.size}, vectors=${this.vectorStore.size})`,
 			);
 		} catch (err) {
+			this.noteStore.clear();
+			this.chunkStore.clear();
+			this.vectorStore.clear();
+			await this.logRuntimeError("load-index-snapshot", err, {
+				stage: "index-snapshot-load",
+				errorType: "storage",
+				filePath: this.indexSnapshotPath,
+			});
 			console.warn("Semantic Connections: failed to load index snapshot, starting fresh", err);
 		}
 	}
@@ -526,7 +857,84 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				await this.app.vault.adapter.rename(tmpPath, this.indexSnapshotPath);
 			}
 		} catch (err) {
+			await this.logRuntimeError("save-index-snapshot", err, {
+				stage: "index-snapshot-save",
+				errorType: "storage",
+				filePath: this.indexSnapshotPath,
+			});
 			console.error("Semantic Connections: failed to save index snapshot", err);
+		}
+	}
+
+	private getPathBasename(path: string): string {
+		const normalized = path.replace(/\\/g, "/");
+		const segments = normalized.split("/");
+		return segments[segments.length - 1] || normalized;
+	}
+
+	private async getOldLocalCacheDirectories(): Promise<{
+		modelsRoot: string;
+		currentCache: string;
+		staleCaches: string[];
+	}> {
+		const adapter = this.app.vault.adapter;
+		const modelsRoot = this.getPluginDataPath("models");
+		const currentCache = this.embeddingService.getLocalModelCachePath();
+		if (!(await adapter.exists(modelsRoot))) {
+			return {
+				modelsRoot,
+				currentCache,
+				staleCaches: [],
+			};
+		}
+
+		const list = await adapter.list(modelsRoot);
+		const staleCaches = list.folders.filter((path) => {
+			const baseName = this.getPathBasename(path);
+			return /^cache-v/i.test(baseName) && path !== currentCache;
+		});
+
+		return {
+			modelsRoot,
+			currentCache,
+			staleCaches,
+		};
+	}
+
+	private async cleanOldLocalModelCacheSilently(): Promise<void> {
+		try {
+			const adapter = this.app.vault.adapter;
+			const { staleCaches } = await this.getOldLocalCacheDirectories();
+			if (staleCaches.length === 0) {
+				return;
+			}
+
+			let removed = 0;
+			for (const folder of staleCaches) {
+				try {
+					await adapter.rmdir(folder, true);
+					removed++;
+				} catch (error) {
+					console.warn("Semantic Connections: failed to remove old cache folder", folder, error);
+				}
+			}
+
+			if (removed > 0) {
+				await this.logRuntimeEvent(
+					"old-local-model-cache-cleaned",
+					"Removed stale local model cache directories during startup.",
+					{
+						category: "storage",
+						provider: "local",
+						details: [`removed=${removed}`],
+					},
+				);
+			}
+		} catch (error) {
+			await this.logRuntimeError("clean-old-local-model-cache-silent", error, {
+				stage: "local-cache-cleanup-silent",
+				errorType: "storage",
+			});
 		}
 	}
 
@@ -536,34 +944,17 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	private async cleanOldLocalModelCache(): Promise<void> {
 		const notice = new Notice("正在清理旧模型缓存...", 0);
 		const adapter = this.app.vault.adapter;
-		const modelsRoot = this.getPluginDataPath("models");
-		const currentCache = this.embeddingService.getLocalModelCachePath();
 
 		try {
-			const exists = await adapter.exists(modelsRoot);
-			if (!exists) {
+			const { modelsRoot, staleCaches } = await this.getOldLocalCacheDirectories();
+			if (!(await adapter.exists(modelsRoot))) {
 				notice.setMessage("未发现模型缓存目录，无需清理。");
 				setTimeout(() => notice.hide(), 2500);
 				return;
 			}
 
-			const list = await adapter.list(modelsRoot);
-			const foldersToDelete = list.folders.filter((p) => p !== currentCache);
-			const filesToDelete = list.files.filter((p) => p !== currentCache);
-
 			let removedFolders = 0;
-			let removedFiles = 0;
-
-			for (const file of filesToDelete) {
-				try {
-					await adapter.remove(file);
-					removedFiles++;
-				} catch (err) {
-					console.warn("Semantic Connections: failed to remove cache file", file, err);
-				}
-			}
-
-			for (const folder of foldersToDelete) {
+			for (const folder of staleCaches) {
 				try {
 					await adapter.rmdir(folder, true);
 					removedFolders++;
@@ -572,14 +963,27 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				}
 			}
 
-			if (removedFiles === 0 && removedFolders === 0) {
+			if (removedFolders === 0) {
 				notice.setMessage("未发现旧缓存，无需清理。");
 			} else {
-				notice.setMessage(`清理完成：移除 ${removedFolders} 个目录，${removedFiles} 个文件。`);
+				notice.setMessage(`清理完成：移除 ${removedFolders} 个旧缓存目录。`);
+				await this.logRuntimeEvent(
+					"old-local-model-cache-cleaned",
+					"Removed stale local model cache directories via command.",
+					{
+						category: "storage",
+						provider: "local",
+						details: [`removed=${removedFolders}`],
+					},
+				);
 			}
 			setTimeout(() => notice.hide(), 3000);
 		} catch (err) {
 			notice.setMessage("清理失败，请查看控制台。");
+			await this.logRuntimeError("clean-old-local-model-cache", err, {
+				stage: "local-cache-cleanup",
+				errorType: "storage",
+			});
 			console.error("Semantic Connections: clean cache failed", err);
 			setTimeout(() => notice.hide(), 4000);
 		}

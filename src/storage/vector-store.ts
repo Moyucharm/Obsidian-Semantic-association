@@ -101,18 +101,33 @@ export class VectorStore {
 	 * 这样只有新增/修改的文件需要重新计算 embedding。
 	 */
 	load(raw: unknown): void {
-		this.vectors.clear();
-		this.dimension = 0;
-
-		if (!raw || typeof raw !== "object") return;
+		if (!raw || typeof raw !== "object") {
+			this.clear();
+			return;
+		}
 
 		const data = raw as VectorStoreData;
-		if (data.version !== CURRENT_VERSION || !data.vectors) return;
-
-		this.dimension = data.dimension || 0;
-		for (const [id, vec] of Object.entries(data.vectors)) {
-			this.vectors.set(id, vec);
+		if (data.version !== CURRENT_VERSION || !data.vectors) {
+			this.clear();
+			return;
 		}
+
+		const nextVectors = new Map<string, Vector>();
+		let nextDimension =
+			typeof data.dimension === "number" && Number.isInteger(data.dimension) && data.dimension > 0
+				? data.dimension
+				: 0;
+
+		for (const [id, vec] of Object.entries(data.vectors)) {
+			const validated = this.validateVector(vec, id, nextDimension);
+			if (nextDimension === 0) {
+				nextDimension = validated.length;
+			}
+			nextVectors.set(id, validated);
+		}
+
+		this.vectors = nextVectors;
+		this.dimension = nextVectors.size > 0 ? nextDimension : 0;
 	}
 
 	/** 导出为可持久化对象 */
@@ -131,10 +146,12 @@ export class VectorStore {
 	 * 否则余弦相似度计算会返回 0（维度不匹配时的保护逻辑）。
 	 */
 	set(id: string, vector: Vector): void {
+		const expectedDimension = this.dimension === 0 ? undefined : this.dimension;
+		const validated = this.validateVector(vector, id, expectedDimension);
 		if (this.dimension === 0) {
-			this.dimension = vector.length;
+			this.dimension = validated.length;
 		}
-		this.vectors.set(id, vector);
+		this.vectors.set(id, validated);
 	}
 
 	/** 批量写入（减少方法调用开销） */
@@ -151,7 +168,9 @@ export class VectorStore {
 
 	/** 删除单条向量 */
 	delete(id: string): boolean {
-		return this.vectors.delete(id);
+		const deleted = this.vectors.delete(id);
+		this.resetDimensionIfEmpty();
+		return deleted;
 	}
 
 	/**
@@ -174,6 +193,7 @@ export class VectorStore {
 				this.vectors.delete(id);
 			}
 		}
+		this.resetDimensionIfEmpty();
 	}
 
 	/**
@@ -234,6 +254,12 @@ export class VectorStore {
 		topK: number,
 		filterFn?: (id: string) => boolean,
 	): VectorSearchResult[] {
+		if (this.dimension > 0 && query.length !== this.dimension) {
+			throw new Error(
+				`VectorStore: query dimension mismatch, expected ${this.dimension}, got ${query.length}`,
+			);
+		}
+
 		const results: VectorSearchResult[] = [];
 
 		for (const [id, vec] of this.vectors) {
@@ -259,6 +285,31 @@ export class VectorStore {
 	clear(): void {
 		this.vectors.clear();
 		this.dimension = 0;
+	}
+
+	private validateVector(
+		vector: unknown,
+		id: string,
+		expectedDimension?: number,
+	): Vector {
+		if (!Array.isArray(vector) || vector.length === 0) {
+			throw new Error(`VectorStore: invalid vector for ${id}`);
+		}
+		if (vector.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
+			throw new Error(`VectorStore: non-finite vector value for ${id}`);
+		}
+		if (expectedDimension !== undefined && vector.length !== expectedDimension) {
+			throw new Error(
+				`VectorStore: dimension mismatch for ${id}, expected ${expectedDimension}, got ${vector.length}`,
+			);
+		}
+		return vector;
+	}
+
+	private resetDimensionIfEmpty(): void {
+		if (this.vectors.size === 0) {
+			this.dimension = 0;
+		}
 	}
 
 	/**

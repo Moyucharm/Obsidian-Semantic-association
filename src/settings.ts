@@ -8,10 +8,24 @@
  * - 自动索引开关
  */
 
-import { App, Notice, PluginSettingTab, Setting, TextComponent } from "obsidian";
+import {
+	App,
+	ButtonComponent,
+	Notice,
+	PluginSettingTab,
+	Setting,
+	TextComponent,
+} from "obsidian";
 import type SemanticConnectionsPlugin from "./main";
-import type { LocalDtype, RemoteModelInfo } from "./types";
+import type {
+	IndexErrorEntry,
+	LocalDtype,
+	RebuildIndexProgress,
+	RemoteModelInfo,
+	RuntimeLogEntry,
+} from "./types";
 import { SUPPORTED_LOCAL_MODELS } from "./embeddings/local-provider";
+import type { LocalModelProgress } from "./embeddings/local-model-shared";
 
 /** 手动输入模型的特殊标记值 */
 const MANUAL_MODEL_VALUE = "__manual__";
@@ -181,9 +195,30 @@ export class SettingTab extends PluginSettingTab {
 							if (result.ok) {
 								resultEl.addClass("is-success");
 								resultEl.setText(`连接成功（向量维度：${result.dimension}）`);
+								await this.plugin.logRuntimeEvent(
+									"remote-connection-test-ok",
+									"Remote embedding connection test succeeded.",
+									{
+										category: "embedding",
+										provider: "remote",
+										details: [
+											`model=${this.plugin.settings.remoteModel}`,
+											`dimension=${result.dimension}`,
+										],
+									},
+								);
 							} else {
 								resultEl.addClass("is-error");
 								resultEl.setText(`连接失败：${result.error}`);
+								await this.plugin.logRuntimeError(
+									"remote-connection-test",
+									result.diagnostic ?? result.error,
+									{
+										errorType: "configuration",
+										filePath: "__settings__/remote-connection-test",
+										provider: "remote",
+									},
+								);
 							}
 
 							btn.setButtonText("测试");
@@ -218,38 +253,125 @@ export class SettingTab extends PluginSettingTab {
 		// ── 索引管理 ──
 		containerEl.createEl("h2", { text: "索引管理" });
 
-		const noteCount = this.plugin.noteStore.size;
-		const chunkCount = this.plugin.chunkStore.size;
-		const statusText = noteCount > 0
-			? `当前索引：${noteCount} 篇笔记，${chunkCount} 个语义块`
-			: "当前无索引数据";
-
 		const rebuildSetting = new Setting(containerEl)
 			.setName("重建索引")
-			.setDesc(statusText)
+			.setDesc("")
 			.addButton((btn) => {
+				const resetButton = (): void => {
+					btn.setButtonText(this.plugin.isRebuilding ? "正在重建..." : "重建索引");
+					btn.setDisabled(this.plugin.isRebuilding);
+				};
+
 				btn
-					.setButtonText(this.plugin.isRebuilding ? "正在重建..." : "重建索引")
 					.setCta()
-					.setDisabled(this.plugin.isRebuilding)
 					.onClick(async () => {
 						btn.setButtonText("正在重建...");
 						btn.setDisabled(true);
-						await this.plugin.rebuildIndex();
-						// 重建完成后刷新设置页，更新索引计数
-						this.display();
+
+						updateRebuildProgress({
+							stage: "checking-local-model",
+							message: "正在准备重建索引...",
+							percent: 0,
+						});
+
+						try {
+							await this.plugin.rebuildIndex({ onProgress: updateRebuildProgress });
+						} finally {
+							updateIndexSummary();
+							resetButton();
+						}
 					});
+
+				resetButton();
 			});
 
-		// 如果有错误日志，追加提示
-		const errorCount = this.plugin.errorLogger.size;
-		if (errorCount > 0) {
-			rebuildSetting.descEl.createEl("br");
-			rebuildSetting.descEl.createEl("span", {
-				text: `错误日志：${errorCount} 条`,
-				cls: "sc-setting-error-hint",
-			});
-		}
+		rebuildSetting.descEl.empty();
+
+		const rebuildSummaryEl = rebuildSetting.descEl.createDiv();
+		const rebuildErrorHintEl = rebuildSetting.descEl.createDiv({
+			cls: "sc-setting-error-hint",
+		});
+		const rebuildStatusEl = rebuildSetting.descEl.createDiv({
+			cls: "sc-rebuild-status",
+		});
+		const rebuildMessageEl = rebuildStatusEl.createDiv();
+		const rebuildProgressEl = rebuildStatusEl.createDiv({
+			cls: "sc-rebuild-progress",
+		});
+		const rebuildProgressBarEl = rebuildProgressEl.createDiv({
+			cls: "sc-rebuild-progress-bar",
+		});
+		const rebuildDetailEl = rebuildStatusEl.createDiv({
+			cls: "sc-rebuild-detail",
+		});
+
+		const clampPercent = (value?: number): number => {
+			if (typeof value !== "number" || Number.isNaN(value)) {
+				return 0;
+			}
+			return Math.max(0, Math.min(100, Math.round(value)));
+		};
+
+		const updateIndexSummary = (): void => {
+			const noteCount = this.plugin.noteStore.size;
+			const chunkCount = this.plugin.chunkStore.size;
+			rebuildSummaryEl.setText(
+				noteCount > 0
+					? `当前索引：${noteCount} 篇笔记，${chunkCount} 个语义块`
+					: "当前无索引数据",
+			);
+
+			const errorCount = this.plugin.errorLogger.size;
+			if (errorCount > 0) {
+				rebuildErrorHintEl.setText(`错误日志：${errorCount} 条`);
+				rebuildErrorHintEl.style.display = "";
+				return;
+			}
+
+			rebuildErrorHintEl.empty();
+			rebuildErrorHintEl.style.display = "none";
+		};
+
+		const updateRebuildProgress = (progress: RebuildIndexProgress): void => {
+			rebuildStatusEl.style.display = "block";
+			rebuildStatusEl.classList.remove("is-success", "is-error");
+
+			if (progress.stage === "success") {
+				rebuildStatusEl.classList.add("is-success");
+			} else if (progress.stage === "error") {
+				rebuildStatusEl.classList.add("is-error");
+			}
+
+			rebuildMessageEl.setText(progress.message);
+			rebuildProgressBarEl.style.width = `${clampPercent(progress.percent)}%`;
+
+			const details: string[] = [];
+			if (typeof progress.done === "number" && typeof progress.total === "number") {
+				details.push(`${progress.done}/${progress.total}`);
+			}
+			if (progress.file) {
+				details.push(progress.file);
+			}
+			if (typeof progress.indexedNotes === "number") {
+				details.push(`已索引 ${progress.indexedNotes} 篇笔记`);
+			}
+			if (typeof progress.failed === "number" && progress.failed > 0) {
+				details.push(`失败 ${progress.failed} 篇`);
+			}
+
+			if (details.length > 0) {
+				rebuildDetailEl.setText(details.join(" · "));
+				rebuildDetailEl.style.display = "";
+				return;
+			}
+
+			rebuildDetailEl.empty();
+			rebuildDetailEl.style.display = "none";
+		};
+
+		updateIndexSummary();
+		rebuildStatusEl.style.display = "none";
+		rebuildDetailEl.style.display = "none";
 	}
 
 	/**
@@ -412,10 +534,9 @@ export class SettingTab extends PluginSettingTab {
 	 * 包含模型选择 dropdown 和测试按钮。
 	 */
 	private renderLocalModelSettings(containerEl: HTMLElement): void {
-		// 模型选择 dropdown
 		new Setting(containerEl)
 			.setName("本地模型")
-			.setDesc("选择用于本地 Embedding 的模型（首次使用时将自动下载）")
+			.setDesc("选择用于本地 Embedding 的模型")
 			.addDropdown((dropdown) => {
 				for (const model of SUPPORTED_LOCAL_MODELS) {
 					dropdown.addOption(model.id, model.name);
@@ -431,17 +552,16 @@ export class SettingTab extends PluginSettingTab {
 						this.plugin.noteStore.clear();
 						this.plugin.chunkStore.clear();
 						this.plugin.vectorStore.clear();
-						new Notice("本地模型已切换，索引已清空。请执行「重建索引」。", 8000);
+						new Notice("本地模型已切换，索引已清空。请执行“重建索引”。", 8000);
 					}
 
 					this.display();
 				});
 			});
 
-		// 量化精度选择
 		new Setting(containerEl)
 			.setName("量化精度")
-			.setDesc("模型量化等级，影响下载大小和推理精度")
+			.setDesc("模型量化等级，影响下载体积和推理精度")
 			.addDropdown((dropdown) => {
 				for (const opt of DTYPE_OPTIONS) {
 					dropdown.addOption(opt.value, opt.label);
@@ -457,35 +577,381 @@ export class SettingTab extends PluginSettingTab {
 						this.plugin.noteStore.clear();
 						this.plugin.chunkStore.clear();
 						this.plugin.vectorStore.clear();
-						new Notice("量化精度已切换，索引已清空。请执行「重建索引」。", 8000);
+						new Notice("量化精度已切换，索引已清空。请执行“重建索引”。", 8000);
 					}
 
 					this.display();
 				});
 			});
 
-		// 当前选中模型的描述（含动态下载大小）
 		const selectedModel = SUPPORTED_LOCAL_MODELS.find(
-			(m) => m.id === this.plugin.settings.localModelId,
+			(model) => model.id === this.plugin.settings.localModelId,
 		);
 		if (selectedModel) {
 			const currentDtype = this.plugin.settings.localDtype;
-			const sizeHint = selectedModel.sizeHints[currentDtype] ?? selectedModel.sizeHints["q8"];
+			const sizeHint = selectedModel.sizeHints[currentDtype] ?? selectedModel.sizeHints.q8;
 			new Setting(containerEl)
 				.setName("模型信息")
-				.setDesc(`${selectedModel.description}（维度：${selectedModel.dimension}，预计下载：${sizeHint}）`);
+				.setDesc(
+					`${selectedModel.description}（维度：${selectedModel.dimension}，预计下载：${sizeHint}）`,
+				);
 		}
 
-		// 测试按钮
+		let downloadButton: ButtonComponent | null = null;
+		let redownloadButton: ButtonComponent | null = null;
+		let runtimeLogOutputEl!: HTMLPreElement;
+		let errorLogOutputEl!: HTMLPreElement;
+
+		const downloadSetting = new Setting(containerEl)
+			.setName("下载本地模型")
+			.setDesc("点击下载并预热当前本地模型。若缓存已存在，会直接从本地加载。")
+			.addButton((btn) => {
+				downloadButton = btn;
+				btn
+					.setButtonText("下载")
+					.setCta()
+					.onClick(async () => {
+						await runLocalModelDownload();
+					});
+			})
+			.addButton((btn) => {
+				redownloadButton = btn;
+				btn
+					.setButtonText("清理缓存并重下")
+					.onClick(async () => {
+						await runLocalModelDownload({ clearCacheFirst: true });
+					});
+			});
+
+		const downloadStatusEl = downloadSetting.descEl.createDiv({
+			cls: "sc-local-download-status",
+		});
+		const downloadMessageEl = downloadStatusEl.createDiv();
+		const downloadProgressEl = downloadStatusEl.createDiv({
+			cls: "sc-local-download-progress",
+		});
+		const downloadProgressBarEl = downloadProgressEl.createDiv({
+			cls: "sc-local-download-progress-bar",
+		});
+		const downloadDetailEl = downloadStatusEl.createDiv({
+			cls: "sc-local-download-detail",
+		});
+
+		const setDownloadButtonsDisabled = (disabled: boolean): void => {
+			downloadButton?.setDisabled(disabled);
+			redownloadButton?.setDisabled(disabled);
+		};
+
+		const updateDownloadStatus = (state: {
+			message: string;
+			percent?: number;
+			detail?: string;
+			tone?: "success" | "error";
+		}): void => {
+			downloadStatusEl.style.display = "block";
+			downloadStatusEl.classList.remove("is-success", "is-error");
+			if (state.tone === "success") {
+				downloadStatusEl.classList.add("is-success");
+			} else if (state.tone === "error") {
+				downloadStatusEl.classList.add("is-error");
+			}
+
+			downloadMessageEl.setText(state.message);
+			downloadProgressBarEl.style.width = `${Math.max(
+				0,
+				Math.min(100, Math.round(state.percent ?? 0)),
+			)}%`;
+
+			if (state.detail) {
+				downloadDetailEl.setText(state.detail);
+				downloadDetailEl.style.display = "";
+				return;
+			}
+
+			downloadDetailEl.empty();
+			downloadDetailEl.style.display = "none";
+		};
+
+		const renderRuntimeLog = (): void => {
+			runtimeLogOutputEl.setText(
+				this.formatRuntimeLogEntries(this.plugin.getRecentRuntimeLogs(30)),
+			);
+		};
+
+		const renderErrorLog = (): void => {
+			errorLogOutputEl.setText(
+				this.formatErrorLogEntries(this.plugin.errorLogger.getRecent(20)),
+			);
+		};
+
+		const runLocalModelDownload = async (
+			options: { clearCacheFirst?: boolean } = {},
+		): Promise<void> => {
+			setDownloadButtonsDisabled(true);
+			const modelId = this.plugin.settings.localModelId;
+			const dtype = this.plugin.settings.localDtype;
+			let sawFirstByte = false;
+			let sawDownloadStarted = false;
+			let sawReady = false;
+			let sawWarmup = false;
+			let latestDownloadPercent = 0;
+
+			try {
+				if (options.clearCacheFirst) {
+					updateDownloadStatus({
+						message: "正在清理当前本地模型缓存...",
+						percent: 0,
+					});
+
+					const clearResult = await this.clearCurrentLocalModelCache();
+					await this.plugin.logRuntimeEvent(
+						"local-model-cache-cleared",
+						clearResult.removed
+							? "已清理当前本地模型缓存，准备重新下载。"
+							: "未发现当前本地模型缓存，直接开始下载。",
+						{
+							category: "storage",
+							provider: "local",
+							details: [`cache_path=${clearResult.cachePath}`],
+						},
+					);
+				}
+
+				updateDownloadStatus({
+					message: "正在准备本地模型...",
+					percent: 0,
+					detail: `模型：${modelId} · 精度：${dtype}`,
+				});
+
+				await this.plugin.logRuntimeEvent(
+					"local-model-download-requested",
+					"用户在设置页触发了本地模型下载。",
+					{
+						category: "embedding",
+						provider: "local",
+						details: [`model=${modelId}`, `dtype=${dtype}`],
+					},
+				);
+
+				const result = await this.plugin.embeddingService.prepareLocalModel({
+					progressListener: (progress: LocalModelProgress) => {
+						const progressValue =
+							typeof progress.progress === "number"
+								? progress.progress
+								: typeof progress.loaded === "number" &&
+									  typeof progress.total === "number" &&
+									  progress.total > 0
+									? (progress.loaded / progress.total) * 100
+									: 0;
+						if (progress.status === "download" || progress.status === "progress") {
+							latestDownloadPercent = progressValue;
+							if (!sawDownloadStarted) {
+								sawDownloadStarted = true;
+								void this.plugin.logRuntimeEvent(
+									"local-model-download-started",
+									"Local model download entered file transfer stage.",
+									{
+										category: "embedding",
+										provider: "local",
+										details: [
+											`model=${modelId}`,
+											`dtype=${dtype}`,
+											progress.file ? `file=${progress.file}` : undefined,
+										].filter((item): item is string => Boolean(item)),
+									},
+								);
+							}
+						}
+
+						if (
+							!sawFirstByte &&
+							((typeof progress.loaded === "number" && progress.loaded > 0) ||
+								progressValue > 0)
+						) {
+							sawFirstByte = true;
+							void this.plugin.logRuntimeEvent(
+								"local-model-download-first-byte",
+								"已开始接收本地模型文件数据。",
+								{
+									category: "embedding",
+									provider: "local",
+									details: [
+										progress.file ? `file=${progress.file}` : undefined,
+										typeof progress.loaded === "number"
+											? `loaded=${progress.loaded}`
+											: undefined,
+										typeof progress.total === "number"
+											? `total=${progress.total}`
+											: undefined,
+									].filter((item): item is string => Boolean(item)),
+								},
+							);
+						}
+
+						let message = "正在准备本地模型...";
+						if ((progress.status === "download" || progress.status === "progress") && progress.file) {
+							message =
+								progress.status === "progress"
+									? `正在下载本地模型：${progress.file} (${Math.round(progressValue)}%)`
+									: `正在下载本地模型：${progress.file}`;
+						} else if (progress.status === "ready") {
+							if (!sawReady) {
+								sawReady = true;
+								void this.plugin.logRuntimeEvent(
+									"local-model-download-ready",
+									"Local model files are ready; runtime initialization is starting.",
+									{
+										category: "embedding",
+										provider: "local",
+										details: [`model=${modelId}`, `dtype=${dtype}`],
+									},
+								);
+							}
+							message = "本地模型文件已就绪，正在完成加载...";
+						} else if (progress.status === "done") {
+							message = progress.file
+								? `模型文件已完成：${progress.file}`
+								: "模型文件下载完成，等待继续初始化...";
+						} else if (progress.status === "warmup") {
+							if (!sawReady) {
+								sawReady = true;
+								void this.plugin.logRuntimeEvent(
+									"local-model-download-ready",
+									"Local model files are ready; runtime initialization is starting.",
+									{
+										category: "embedding",
+										provider: "local",
+										details: [`model=${modelId}`, `dtype=${dtype}`],
+									},
+								);
+							}
+							if (!sawWarmup) {
+								sawWarmup = true;
+								void this.plugin.logRuntimeEvent(
+									"local-model-download-warmup",
+									"Local model entered warmup stage.",
+									{
+										category: "embedding",
+										provider: "local",
+										details: [`model=${modelId}`, `dtype=${dtype}`],
+									},
+								);
+							}
+							message = "正在预热本地模型...";
+						}
+
+						const detailParts = [
+							progress.file,
+							typeof progress.loaded === "number" && typeof progress.total === "number"
+								? `${progress.loaded}/${progress.total} bytes`
+								: undefined,
+							`模型：${modelId}`,
+							`精度：${dtype}`,
+						].filter((item): item is string => Boolean(item));
+
+						updateDownloadStatus({
+							message,
+							percent:
+								progress.status === "download" || progress.status === "progress"
+									? progressValue
+									: latestDownloadPercent,
+							detail: detailParts.join(" · "),
+						});
+					},
+				});
+
+				if (result.ok) {
+					updateDownloadStatus({
+						message: `模型已就绪（向量维度：${result.dimension}）`,
+						percent: 100,
+						detail: `模型：${modelId} · 精度：${dtype}`,
+						tone: "success",
+					});
+					await this.plugin.logRuntimeEvent(
+						"local-model-ready",
+						"本地模型已完成下载并预热。",
+						{
+							category: "embedding",
+							provider: "local",
+							details: [
+								`model=${modelId}`,
+								`dtype=${dtype}`,
+								`dimension=${result.dimension}`,
+							],
+						},
+					);
+				} else {
+					updateDownloadStatus({
+						message: `模型下载失败：${result.error}`,
+						percent: 0,
+						detail: `模型：${modelId} · 精度：${dtype}`,
+						tone: "error",
+					});
+					await this.plugin.logRuntimeEvent(
+						"local-model-download-failed",
+						`本地模型下载失败：${result.error}`,
+						{
+							level: "warn",
+							category: "embedding",
+							provider: "local",
+							details: [`model=${modelId}`, `dtype=${dtype}`],
+						},
+					);
+					await this.plugin.logRuntimeError("local-model-download", result.diagnostic ?? result.error, {
+						errorType: "runtime",
+						filePath: "__settings__/local-model-download",
+						provider: "local",
+					});
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				updateDownloadStatus({
+					message: `模型下载失败：${message}`,
+					percent: 0,
+					detail: `模型：${modelId} · 精度：${dtype}`,
+					tone: "error",
+				});
+				await this.plugin.logRuntimeEvent(
+					"local-model-download-failed",
+					`本地模型下载失败：${message}`,
+					{
+						level: "warn",
+						category: "embedding",
+						provider: "local",
+						details: [`model=${modelId}`, `dtype=${dtype}`],
+					},
+				);
+				await this.plugin.logRuntimeError("local-model-download", error, {
+					errorType: "runtime",
+					filePath: "__settings__/local-model-download",
+					provider: "local",
+				});
+			} finally {
+				setDownloadButtonsDisabled(false);
+				renderRuntimeLog();
+				renderErrorLog();
+			}
+		};
+
 		const testSetting = new Setting(containerEl)
 			.setName("测试本地模型")
-			.setDesc("加载模型并执行一次测试推理（首次可能需要下载模型文件）")
+			.setDesc("加载模型并执行一次测试推理（不会主动重新下载）")
 			.addButton((btn) => {
 				btn
 					.setButtonText("测试")
 					.onClick(async () => {
-						btn.setButtonText("加载中...");
+						btn.setButtonText("测试中...");
 						btn.setDisabled(true);
+
+						await this.plugin.logRuntimeEvent(
+							"local-model-test-requested",
+							"用户在设置页触发了本地模型测试。",
+							{
+								category: "embedding",
+								provider: "local",
+								details: [`model=${this.plugin.settings.localModelId}`, `dtype=${this.plugin.settings.localDtype}`],
+							},
+						);
 
 						this.plugin.embeddingService.switchProvider(this.plugin.settings);
 						const result = await this.plugin.embeddingService.testConnection();
@@ -498,16 +964,167 @@ export class SettingTab extends PluginSettingTab {
 
 						if (result.ok) {
 							resultEl.addClass("is-success");
-							resultEl.setText(`模型加载成功（向量维度：${result.dimension}）`);
+							resultEl.setText(`模型测试成功（向量维度：${result.dimension}）`);
+							await this.plugin.logRuntimeEvent(
+								"local-model-test-ok",
+								"本地模型测试成功。",
+								{
+									category: "embedding",
+									provider: "local",
+									details: [
+										`model=${this.plugin.settings.localModelId}`,
+										`dtype=${this.plugin.settings.localDtype}`,
+										`dimension=${result.dimension}`,
+									],
+								},
+							);
 						} else {
 							resultEl.addClass("is-error");
-							resultEl.setText(`模型加载失败：${result.error}`);
+							resultEl.setText(`模型测试失败：${result.error}`);
+							await this.plugin.logRuntimeEvent(
+								"local-model-test-failed",
+								`本地模型测试失败：${result.error}`,
+								{
+									level: "warn",
+									category: "embedding",
+									provider: "local",
+									details: [
+										`model=${this.plugin.settings.localModelId}`,
+										`dtype=${this.plugin.settings.localDtype}`,
+									],
+								},
+							);
+							await this.plugin.logRuntimeError(
+								"local-model-test",
+								result.diagnostic ?? result.error,
+								{
+									errorType: "runtime",
+									filePath: "__settings__/local-model-test",
+									provider: "local",
+								},
+							);
 						}
 
+						renderRuntimeLog();
+						renderErrorLog();
 						btn.setButtonText("测试");
 						btn.setDisabled(false);
 					});
 			});
+
+		const runtimeLogSetting = new Setting(containerEl)
+			.setName("运行日志")
+			.setDesc("显示最近 30 条本地模型运行日志")
+			.addButton((btn) => {
+				btn.setButtonText("刷新").onClick(() => {
+					renderRuntimeLog();
+				});
+			})
+			.addButton((btn) => {
+				btn.setButtonText("清空").onClick(async () => {
+					btn.setDisabled(true);
+					await this.plugin.clearRuntimeLogs();
+					renderRuntimeLog();
+					btn.setDisabled(false);
+				});
+			});
+
+		runtimeLogOutputEl = runtimeLogSetting.descEl.createEl("pre", {
+			cls: "sc-log-output",
+		});
+
+		const errorLogSetting = new Setting(containerEl)
+			.setName("错误日志")
+			.setDesc("显示最近 20 条索引和运行错误")
+			.addButton((btn) => {
+				btn.setButtonText("刷新").onClick(() => {
+					renderErrorLog();
+				});
+			})
+			.addButton((btn) => {
+				btn.setButtonText("清空").onClick(async () => {
+					btn.setDisabled(true);
+					await this.plugin.errorLogger.clear();
+					renderErrorLog();
+					btn.setDisabled(false);
+				});
+			});
+
+		errorLogOutputEl = errorLogSetting.descEl.createEl("pre", {
+			cls: "sc-log-output",
+		});
+
+		downloadStatusEl.style.display = "none";
+		downloadDetailEl.style.display = "none";
+		renderRuntimeLog();
+		renderErrorLog();
+	}
+
+	private formatRuntimeLogEntries(entries: RuntimeLogEntry[]): string {
+		if (entries.length === 0) {
+			return "暂无运行日志。";
+		}
+
+		return entries
+			.map((entry) => {
+				const header = `[${this.formatLogTimestamp(entry.timestamp)}] ${entry.level.toUpperCase()} ${entry.event}`;
+				const lines = [header, `  ${entry.message}`];
+				const meta = [entry.category, entry.provider].filter((item): item is string => Boolean(item));
+				if (meta.length > 0) {
+					lines.push(`  ${meta.join(" · ")}`);
+				}
+				if (entry.details && entry.details.length > 0) {
+					lines.push(...entry.details.map((detail) => `  - ${detail}`));
+				}
+				return lines.join("\n");
+			})
+			.join("\n\n");
+	}
+
+	private formatErrorLogEntries(entries: IndexErrorEntry[]): string {
+		if (entries.length === 0) {
+			return "暂无错误日志。";
+		}
+
+		return entries
+			.map((entry) => {
+				const header = `[${this.formatLogTimestamp(entry.timestamp)}] ${entry.errorType} ${entry.filePath}`;
+				const lines = [header, `  ${entry.message}`];
+				const meta = [
+					entry.provider ? `provider=${entry.provider}` : undefined,
+					entry.stage ? `stage=${entry.stage}` : undefined,
+				].filter((item): item is string => Boolean(item));
+				if (meta.length > 0) {
+					lines.push(`  ${meta.join(" · ")}`);
+				}
+				if (entry.details && entry.details.length > 0) {
+					lines.push(...entry.details.map((detail) => `  - ${detail}`));
+				}
+				return lines.join("\n");
+			})
+			.join("\n\n");
+	}
+
+	private formatLogTimestamp(timestamp: number): string {
+		return new Date(timestamp).toLocaleString("zh-CN", {
+			hour12: false,
+		});
+	}
+
+	private async clearCurrentLocalModelCache(): Promise<{ removed: boolean; cachePath: string }> {
+		const adapter = this.app.vault.adapter;
+		const cachePath = this.plugin.embeddingService.getLocalModelCachePath();
+
+		await this.plugin.embeddingService.disposeCurrentProvider().catch(() => undefined);
+
+		if (!(await adapter.exists(cachePath))) {
+			this.plugin.embeddingService.switchProvider(this.plugin.settings);
+			return { removed: false, cachePath };
+		}
+
+		await adapter.rmdir(cachePath, true);
+		this.plugin.embeddingService.switchProvider(this.plugin.settings);
+		return { removed: true, cachePath };
 	}
 
 	/**
@@ -539,6 +1156,15 @@ export class SettingTab extends PluginSettingTab {
 			this.cachedModels = result.models;
 			this.populateModelDropdown(selectEl, result.models);
 			dropdown.setValue(this.plugin.settings.remoteModel || MANUAL_MODEL_VALUE);
+			await this.plugin.logRuntimeEvent(
+				"remote-model-list-fetched",
+				"Fetched remote embedding model list.",
+				{
+					category: "embedding",
+					provider: "remote",
+					details: [`count=${result.models.length}`],
+				},
+			);
 		} else {
 			// 拉取失败或列表为空：显示提示
 			const errorText = result.ok
@@ -548,6 +1174,17 @@ export class SettingTab extends PluginSettingTab {
 				cls: "sc-model-fetch-hint is-error",
 				text: errorText,
 			});
+			if (!result.ok) {
+				await this.plugin.logRuntimeError(
+					"remote-model-list-fetch",
+					result.diagnostic ?? result.error,
+					{
+						errorType: "configuration",
+						filePath: "__settings__/remote-model-list-fetch",
+						provider: "remote",
+					},
+				);
+			}
 		}
 	}
 

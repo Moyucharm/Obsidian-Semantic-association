@@ -123,7 +123,7 @@ export class ReindexQueue {
 	 * 2. 重置防抖计时器（重新开始倒计时）
 	 */
 	enqueue(task: IndexTask): void {
-		this.pending.set(task.path, task);
+		this.pending.set(this.getTaskKey(task), task);
 		this.resetDebounce();
 	}
 
@@ -223,5 +223,12 @@ export class ReindexQueue {
 				this.resetDebounce();
 			}
 		}
+	}
+
+	private getTaskKey(task: IndexTask): string {
+		if (task.type === "rename") {
+			return `rename:${task.oldPath ?? ""}->${task.path}`;
+		}
+		return `path:${task.path}`;
 	}
 }

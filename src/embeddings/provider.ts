@@ -108,6 +108,16 @@ export interface EmbeddingProvider {
 	embedBatch(texts: string[]): Promise<Vector[]>;
 
 	/**
+	 * 可选的预热/初始化钩子
+	 *
+	 * 主要用于本地模型：
+	 * - 触发模型文件下载
+	 * - 初始化推理会话
+	 * - 在不执行额外业务推理的前提下返回最终向量维度
+	 */
+	prepare?(): Promise<number>;
+
+	/**
 	 * 释放 provider 持有的资源（可选）
 	 *
 	 * 使用场景：

@@ -414,16 +414,7 @@ export class RemoteProvider implements EmbeddingProvider {
 
 				const data = response.json as EmbeddingResponse;
 
-				// 验证响应完整性
-				if (!data.data || data.data.length === 0) {
-					throw new Error("API returned empty embedding data");
-				}
-
-				// 按 index 排序
-				// OpenAI 文档未保证返回顺序与输入顺序一致，
-				// 实际测试中通常是有序的，但为安全起见排序处理
-				const sorted = data.data.sort((a, b) => a.index - b.index);
-				const vectors = sorted.map((item) => item.embedding);
+				const vectors = this.normalizeEmbeddingResponse(data, cleanedInputs.length);
 
 				// 动态更新维度：从实际返回的向量长度推断
 				if (vectors.length > 0) {
@@ -438,6 +429,9 @@ export class RemoteProvider implements EmbeddingProvider {
 				// 429（Rate Limit）或 5xx（Server Error）：可重试
 				// 这些是临时性错误，重试通常能成功
 				if (statusCode === 429 || (statusCode >= 500 && statusCode < 600)) {
+					if (attempt === MAX_RETRIES - 1) {
+						break;
+					}
 					// 指数退避：1000ms → 2000ms → 4000ms
 					const delay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
 					console.warn(
@@ -459,6 +453,63 @@ export class RemoteProvider implements EmbeddingProvider {
 		throw new Error(
 			`Remote Embedding API failed after ${MAX_RETRIES} retries: ${this.formatError(lastError)}`,
 		);
+	}
+
+	private normalizeEmbeddingResponse(
+		data: EmbeddingResponse,
+		expectedCount: number,
+	): Vector[] {
+		if (!Array.isArray(data.data) || data.data.length === 0) {
+			throw new Error("API returned empty embedding data");
+		}
+		if (data.data.length !== expectedCount) {
+			throw new Error(
+				`API returned ${data.data.length} embeddings, expected ${expectedCount}`,
+			);
+		}
+
+		const seenIndexes = new Set<number>();
+		const sorted = [...data.data].sort((a, b) => a.index - b.index);
+		const vectors: Vector[] = [];
+		let dimension = 0;
+
+		for (let i = 0; i < sorted.length; i++) {
+			const item = sorted[i];
+			if (!Number.isInteger(item.index) || item.index < 0 || item.index >= expectedCount) {
+				throw new Error(`API returned invalid embedding index ${String(item.index)}`);
+			}
+			if (seenIndexes.has(item.index)) {
+				throw new Error(`API returned duplicate embedding index ${item.index}`);
+			}
+			if (item.index !== i) {
+				throw new Error(
+					`API returned non-contiguous embedding indexes, expected ${i}, got ${item.index}`,
+				);
+			}
+			if (!Array.isArray(item.embedding) || item.embedding.length === 0) {
+				throw new Error(`API returned invalid embedding payload for index ${item.index}`);
+			}
+			if (
+				item.embedding.some(
+					(value) => typeof value !== "number" || !Number.isFinite(value),
+				)
+			) {
+				throw new Error(`API returned non-finite embedding value for index ${item.index}`);
+			}
+
+			if (dimension === 0) {
+				dimension = item.embedding.length;
+			} else if (item.embedding.length !== dimension) {
+				throw new Error(
+					`API returned mixed embedding dimensions, expected ${dimension}, got ${item.embedding.length}`,
+				);
+			}
+
+			seenIndexes.add(item.index);
+			vectors.push(item.embedding);
+		}
+
+		return vectors;
 	}
 
 	/**
