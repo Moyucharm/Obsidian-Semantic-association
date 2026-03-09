@@ -30,6 +30,7 @@ import { Chunker } from "./indexing/chunker";
 import { ReindexService } from "./indexing/reindex-service";
 import { ReindexQueue } from "./indexing/reindex-queue";
 import { EmbeddingService } from "./embeddings/embedding-service";
+import { normalizeRemoteBaseUrl } from "./embeddings/remote-provider";
 import { ConnectionsService } from "./search/connections-service";
 import { LookupService } from "./search/lookup-service";
 import { ErrorLogger } from "./utils/error-logger";
@@ -184,7 +185,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				? String(loaded["embeddingProvider"])
 				: undefined;
 		const embeddingProvider =
-			storedEmbeddingProvider === "mock" || storedEmbeddingProvider === "local"
+			storedEmbeddingProvider === "mock" ||
+			storedEmbeddingProvider === "local" ||
+			storedEmbeddingProvider === "remote"
 				? storedEmbeddingProvider
 				: DEFAULT_SETTINGS.embeddingProvider;
 		const excludedFolders = Array.isArray(loaded.excludedFolders)
@@ -218,6 +221,30 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				typeof loaded.forcePluginLocalModelStorage === "boolean"
 					? loaded.forcePluginLocalModelStorage
 					: DEFAULT_SETTINGS.forcePluginLocalModelStorage,
+			remoteBaseUrl:
+				typeof loaded.remoteBaseUrl === "string"
+					? loaded.remoteBaseUrl.trim()
+					: DEFAULT_SETTINGS.remoteBaseUrl,
+			remoteApiKey:
+				typeof loaded.remoteApiKey === "string"
+					? loaded.remoteApiKey.trim()
+					: DEFAULT_SETTINGS.remoteApiKey,
+			remoteModel:
+				typeof loaded.remoteModel === "string" && loaded.remoteModel.trim().length > 0
+					? loaded.remoteModel.trim()
+					: DEFAULT_SETTINGS.remoteModel,
+			remoteTimeoutMs:
+				typeof loaded.remoteTimeoutMs === "number" &&
+				Number.isInteger(loaded.remoteTimeoutMs) &&
+				loaded.remoteTimeoutMs > 0
+					? loaded.remoteTimeoutMs
+					: DEFAULT_SETTINGS.remoteTimeoutMs,
+			remoteBatchSize:
+				typeof loaded.remoteBatchSize === "number" &&
+				Number.isInteger(loaded.remoteBatchSize) &&
+				loaded.remoteBatchSize > 0
+					? loaded.remoteBatchSize
+					: DEFAULT_SETTINGS.remoteBatchSize,
 		};
 	}
 
@@ -503,6 +530,22 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					{
 						category: "lifecycle",
 						provider: "local",
+					},
+				);
+			} else if (
+				this.settings.embeddingProvider === "remote" &&
+				(!this.settings.remoteBaseUrl.trim() || !this.settings.remoteApiKey.trim())
+			) {
+				new Notice(
+					"当前使用远程 embeddings 且配置不完整。请先填写 API Base URL 和 API Key，再手动执行“重建索引”。",
+					8000,
+				);
+				await this.logRuntimeEvent(
+					"startup-auto-rebuild-skipped",
+					"已跳过启动时自动重建，因为远程 embeddings 配置不完整。",
+					{
+						category: "lifecycle",
+						provider: "remote",
 					},
 				);
 			} else {
@@ -960,6 +1003,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				embeddingDimension?: number;
 				localModelId?: string;
 				localDtype?: string;
+				remoteBaseUrl?: string;
+				remoteModel?: string;
 				vectorBinaryPath?: string;
 				noteStore?: unknown;
 				chunkStore?: unknown;
@@ -991,6 +1036,12 @@ export default class SemanticConnectionsPlugin extends Plugin {
 							snapshot.localModelId !== this.settings.localModelId) ||
 						(snapshot.localDtype &&
 							snapshot.localDtype !== this.settings.localDtype)
+					: this.settings.embeddingProvider === "remote"
+						? (snapshot.remoteModel &&
+								snapshot.remoteModel !== this.settings.remoteModel) ||
+							(snapshot.remoteBaseUrl &&
+								snapshot.remoteBaseUrl !==
+									normalizeRemoteBaseUrl(this.settings.remoteBaseUrl))
 					: false;
 
 			const dimensionMismatch =
@@ -1095,6 +1146,14 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				localDtype:
 					this.settings.embeddingProvider === "local"
 						? this.settings.localDtype
+						: undefined,
+				remoteBaseUrl:
+					this.settings.embeddingProvider === "remote"
+						? normalizeRemoteBaseUrl(this.settings.remoteBaseUrl)
+						: undefined,
+				remoteModel:
+					this.settings.embeddingProvider === "remote"
+						? this.settings.remoteModel.trim()
 						: undefined,
 				vectorBinaryPath: this.indexVectorSnapshotPath,
 				noteStore: this.noteStore.serialize(),

@@ -4,6 +4,7 @@ import { normalizeErrorDiagnostic } from "../utils/error-utils";
 import type { EmbeddingProvider } from "./provider";
 import { MockProvider } from "./mock-provider";
 import { LocalProvider, SUPPORTED_LOCAL_MODELS } from "./local-provider";
+import { RemoteProvider } from "./remote-provider";
 import type { LocalModelProgress, LocalProviderRuntimeEvent } from "./local-provider";
 
 const LOCAL_MODEL_CACHE_VERSION = 2;
@@ -197,10 +198,22 @@ export class EmbeddingService {
 		});
 	}
 
+	private createRemoteProvider(settings: SemanticConnectionsSettings): RemoteProvider {
+		return new RemoteProvider({
+			baseUrl: settings.remoteBaseUrl,
+			apiKey: settings.remoteApiKey,
+			model: settings.remoteModel,
+			timeoutMs: settings.remoteTimeoutMs,
+			batchSize: settings.remoteBatchSize,
+		});
+	}
+
 	private createProvider(settings: SemanticConnectionsSettings): EmbeddingProvider {
 		switch (settings.embeddingProvider) {
 			case "local":
 				return this.createLocalProvider();
+			case "remote":
+				return this.createRemoteProvider(settings);
 			case "mock":
 			default:
 				return new MockProvider();

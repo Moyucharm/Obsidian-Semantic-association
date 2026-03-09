@@ -79,12 +79,17 @@ export interface LookupResult {
 export interface SemanticConnectionsSettings {
 	maxConnections: number;
 	excludedFolders: string[];
-	embeddingProvider: "mock" | "local";
+	embeddingProvider: "mock" | "local" | "remote";
 	autoIndex: boolean;
 	autoOpenConnectionsView: boolean;
 	localModelId: string;
 	localDtype: LocalDtype;
 	forcePluginLocalModelStorage: boolean;
+	remoteBaseUrl: string;
+	remoteApiKey: string;
+	remoteModel: string;
+	remoteTimeoutMs: number;
+	remoteBatchSize: number;
 }
 
 export type ErrorLogType =
@@ -164,4 +169,9 @@ export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	localModelId: "Xenova/bge-base-zh-v1.5",
 	localDtype: "q8",
 	forcePluginLocalModelStorage: false,
+	remoteBaseUrl: "",
+	remoteApiKey: "",
+	remoteModel: "BAAI/bge-m3",
+	remoteTimeoutMs: 30_000,
+	remoteBatchSize: 16,
 };

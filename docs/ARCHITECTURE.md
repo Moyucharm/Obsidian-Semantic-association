@@ -532,3 +532,137 @@ exposing Node-like `process` globals. The local model Web Worker therefore
 spoofs the environment only around `@huggingface/transformers` import and
 `pipeline()` initialization, so Transformers.js keeps using the browser/WASM
 backend instead of switching to the Node device list (`dml`, `cpu`).
+
+---
+
+## 十二、Remote Embeddings 补充（2026-03-09）
+
+本次实现后，插件的 Embedding Provider 共有三种：
+
+- `mock`：开发与兜底用途。
+- `local`：本地 Transformers.js + ONNX Runtime Web。
+- `remote`：远程 OpenAI 兼容 embeddings API。
+
+### 1. RemoteProvider 的职责
+
+代码入口：
+
+- `src/embeddings/remote-provider.ts`
+- `src/embeddings/embedding-service.ts`
+
+`RemoteProvider` 复用现有 `EmbeddingProvider` 接口，不改索引和检索主流程。  
+因此 `ReindexService`、`LookupService`、`ConnectionsService` 仍只依赖：
+
+- `EmbeddingService.embed()`
+- `EmbeddingService.embedBatch()`
+
+### 2. 远程接口约定
+
+插件侧按 OpenAI 兼容 embeddings API 实现，请求格式为：
+
+```http
+POST {baseUrl}/v1/embeddings
+Authorization: Bearer {apiKey}
+Content-Type: application/json
+```
+
+```json
+{
+  "model": "BAAI/bge-m3",
+  "input": ["文本1", "文本2"]
+}
+```
+
+响应最小要求：
+
+```json
+{
+  "data": [
+    { "embedding": [0.1, 0.2] },
+    { "embedding": [0.3, 0.4] }
+  ]
+}
+```
+
+说明：
+
+- 当前仅接入 `BAAI/bge-m3` 的 dense embedding。
+- 不做 sparse embedding。
+- 不做 ColBERT / multi-vector。
+- 默认模型名为 `BAAI/bge-m3`，但设置页允许修改。
+- 虽然 `bge-m3` 的 dense 向量常见认知是 1024 维，但插件不把维度写死；以接口实际返回为准。
+
+### 3. 批量行为
+
+`EmbeddingService.embedBatch()` 走 `RemoteProvider.embedBatch()`。  
+Remote provider 会按照设置中的 `remoteBatchSize` 对输入分批请求远端接口。
+
+这意味着：
+
+- 单条 embedding 和批量 embedding 都可用。
+- 远程 provider 不依赖本地模型缓存。
+- `forcePluginLocalModelStorage` 仅影响 `local` provider，不影响 `remote`。
+
+### 4. 设置页新增项
+
+当 provider 选择为 `remote` 时，设置页会显示：
+
+- `API Base URL`
+- `API Key`
+- `Remote Model`
+- `Timeout`
+- `Batch Size`
+- `Test Connection`
+
+其中 `Test Connection` 会真实发送一次 embeddings 请求，而不是只做本地格式校验。
+
+### 5. 索引与快照兼容性
+
+provider 从 `local/mock` 切到 `remote` 时，行为与原有 provider 切换保持一致：
+
+- 清空现有索引数据
+- 提示用户手动执行“重建索引”
+
+索引快照元数据现在至少记录：
+
+- `embeddingProvider`
+- `embeddingDimension`
+- `remoteModel`
+
+当前实现还额外记录了：
+
+- `remoteBaseUrl`
+
+快照恢复时会检查以下兼容性：
+
+- provider 是否一致
+- `local` provider 下的 `localModelId` / `localDtype`
+- `remote` provider 下的 `remoteModel` / `remoteBaseUrl`
+- 已知维度是否一致
+
+任一不兼容时，插件会拒绝加载旧快照并提示手动重建索引。
+
+### 6. 启动阶段保护
+
+如果当前 provider 是 `remote`，且索引为空，但 `remoteBaseUrl` 或 `remoteApiKey` 尚未配置：
+
+- 插件不会自动触发全量重建
+- 会提示先补齐远程配置，再手动执行“重建索引”
+
+这样可以避免启动阶段立刻打到一个无效远端接口。
+
+### 7. 远程错误处理覆盖面
+
+`RemoteProvider` 当前显式处理以下错误：
+
+- 网络错误
+- 非 2xx HTTP 响应
+- 超时
+- 响应体不是合法 JSON
+- 响应里没有 `data`
+- `data` 项里没有 `embedding`
+- 向量值不是有限数字
+- 同一批次内向量维度不一致
+- 首次建立后的后续请求维度发生漂移
+
+这些错误会继续进入现有的 `ErrorLogger` / `RuntimeLogger` 体系，不引入新的索引主流程分支。

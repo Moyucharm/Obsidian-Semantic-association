@@ -254,6 +254,11 @@ v1 必须支持 chunk 级索引，但 chunk 规则保持简单：
 - `embedding-service.ts`
   - provider 调度层
 
+- `remote-provider.ts`
+  - OpenAI 鍏煎 `/v1/embeddings` 杩滅▼ provider
+  - 榛樿妯″瀷 `BAAI/bge-m3`
+  - 浠呮帴鍏?dense embedding锛屼笉鍋?sparse / ColBERT / multi-vector
+  - 鏀寔鍗曟潯 / 鎵归噺璇锋眰銆佽秴鏃躲€丠TTP / JSON / 缁村害鏍￠獙
 ### `storage/`
 - `note-store.ts`
 - `chunk-store.ts`
@@ -361,3 +366,42 @@ v1 核心功能已全部完成：
 2. 性能优化（大 vault 索引速度、内存占用）
 3. 更多 embedding 模型支持
 4. 搜索结果排序策略优化
+## 2026-03-09 Remote Embeddings Update
+
+The plugin now supports three embedding providers:
+
+- `mock`
+- `local`
+- `remote`
+
+`remote` is implemented as an OpenAI-compatible embeddings client:
+
+- endpoint: `POST {baseUrl}/v1/embeddings`
+- auth: `Authorization: Bearer {apiKey}`
+- default model: `BAAI/bge-m3`
+- scope: dense embedding only
+- not included: sparse embedding, ColBERT, multi-vector
+
+Settings added for `remote`:
+
+- `API Base URL`
+- `API Key`
+- `Remote Model`
+- `Timeout`
+- `Batch Size`
+- `Test Connection`
+
+Behavior notes:
+
+- switching provider to or from `remote` clears old index data and requires rebuild
+- snapshot metadata now records `embeddingProvider`, `embeddingDimension`, and `remoteModel`
+- current implementation also records `remoteBaseUrl` for snapshot compatibility checks
+- if `remote` is selected but `Base URL` or `API Key` is missing, startup auto-rebuild is skipped
+
+Implementation files:
+
+- `src/embeddings/remote-provider.ts`
+- `src/embeddings/embedding-service.ts`
+- `src/settings.ts`
+- `src/main.ts`
+- `src/types.ts`

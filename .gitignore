@@ -13,8 +13,12 @@ node_modules/
 # env
 .env
 .env.*
+local.settings.json
+test-credentials.json
+*.secret.json
 
-# obsidian
+# obsidian / local plugin settings
+# remote API Base URL / API Key saved by the plugin will stay local here
 data.json
 
 # project docs

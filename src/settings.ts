@@ -4,13 +4,15 @@
 
 import { App, ButtonComponent, Notice, PluginSettingTab, Setting } from "obsidian";
 import type SemanticConnectionsPlugin from "./main";
-import type {
-	IndexErrorEntry,
-	LocalDtype,
-	RebuildIndexProgress,
-	RuntimeLogEntry,
+import {
+	DEFAULT_SETTINGS,
+	type IndexErrorEntry,
+	type LocalDtype,
+	type RebuildIndexProgress,
+	type RuntimeLogEntry,
 } from "./types";
 import { SUPPORTED_LOCAL_MODELS } from "./embeddings/local-provider";
+import { normalizeRemoteBaseUrl } from "./embeddings/remote-provider";
 import type { LocalModelProgress } from "./embeddings/local-model-shared";
 
 const DTYPE_OPTIONS: { value: LocalDtype; label: string }[] = [
@@ -107,9 +109,10 @@ export class SettingTab extends PluginSettingTab {
 				dropdown
 					.addOption("mock", "模拟")
 					.addOption("local", "本地模型")
+					.addOption("remote", "远程 API")
 					.setValue(this.plugin.settings.embeddingProvider)
 					.onChange(async (value) => {
-						const nextProvider = value as "mock" | "local";
+						const nextProvider = value as "mock" | "local" | "remote";
 						const prevProvider = this.plugin.settings.embeddingProvider;
 						this.plugin.settings.embeddingProvider = nextProvider;
 						const saved = await this.saveSettingsOrRollback("embedding-provider", () => {
@@ -136,6 +139,10 @@ export class SettingTab extends PluginSettingTab {
 
 		if (this.plugin.settings.embeddingProvider === "local") {
 			this.renderLocalModelSettings(containerEl);
+		}
+
+		if (this.plugin.settings.embeddingProvider === "remote") {
+			this.renderRemoteModelSettings(containerEl);
 		}
 
 		new Setting(containerEl)
@@ -294,6 +301,294 @@ export class SettingTab extends PluginSettingTab {
 		updateIndexSummary();
 		rebuildStatusEl.style.display = "none";
 		rebuildDetailEl.style.display = "none";
+	}
+
+	private renderRemoteModelSettings(containerEl: HTMLElement): void {
+		new Setting(containerEl)
+			.setName("API Base URL")
+			.setDesc("远程 embeddings 服务根地址。插件会自动请求 {baseUrl}/v1/embeddings。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.remoteBaseUrl;
+					const nextValue = normalizeRemoteBaseUrl(text.getValue());
+					this.plugin.settings.remoteBaseUrl = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"remote-base-url",
+						() => {
+							this.plugin.settings.remoteBaseUrl = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(previousValue);
+						return;
+					}
+
+					text.setValue(this.plugin.settings.remoteBaseUrl);
+					if (this.plugin.settings.embeddingProvider === "remote") {
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+					}
+				};
+
+				text
+					.setPlaceholder("https://your-api.example.com")
+					.setValue(this.plugin.settings.remoteBaseUrl);
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("API Key")
+			.setDesc("用于请求远程 embeddings API 的 Bearer Token。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.remoteApiKey;
+					const nextValue = text.getValue().trim();
+					this.plugin.settings.remoteApiKey = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"remote-api-key",
+						() => {
+							this.plugin.settings.remoteApiKey = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(previousValue);
+						return;
+					}
+
+					text.setValue(this.plugin.settings.remoteApiKey);
+					if (this.plugin.settings.embeddingProvider === "remote") {
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+					}
+				};
+
+				text.setPlaceholder("sk-...").setValue(this.plugin.settings.remoteApiKey);
+				text.inputEl.type = "password";
+				text.inputEl.autocomplete = "off";
+				text.inputEl.spellcheck = false;
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Remote Model")
+			.setDesc("默认使用 BAAI/bge-m3，仅接入 dense embedding，实际维度以接口返回为准。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.remoteModel;
+					const nextValue = text.getValue().trim() || DEFAULT_SETTINGS.remoteModel;
+					this.plugin.settings.remoteModel = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"remote-model",
+						() => {
+							this.plugin.settings.remoteModel = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(previousValue);
+						return;
+					}
+
+					text.setValue(this.plugin.settings.remoteModel);
+					if (this.plugin.settings.embeddingProvider === "remote") {
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+						if (previousValue !== nextValue) {
+							this.plugin.noteStore.clear();
+							this.plugin.chunkStore.clear();
+							this.plugin.vectorStore.clear();
+							new Notice("远程模型已更改。索引数据已清空，请重新执行“重建索引”。", 8000);
+						}
+					}
+				};
+
+				text
+					.setPlaceholder(DEFAULT_SETTINGS.remoteModel)
+					.setValue(this.plugin.settings.remoteModel);
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Timeout")
+			.setDesc("远程 embeddings 请求超时时间，单位毫秒。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.remoteTimeoutMs;
+					const nextValue = this.parsePositiveIntegerInput(
+						text.getValue(),
+						DEFAULT_SETTINGS.remoteTimeoutMs,
+						1000,
+					);
+					this.plugin.settings.remoteTimeoutMs = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"remote-timeout-ms",
+						() => {
+							this.plugin.settings.remoteTimeoutMs = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(String(previousValue));
+						return;
+					}
+
+					text.setValue(String(this.plugin.settings.remoteTimeoutMs));
+					if (this.plugin.settings.embeddingProvider === "remote") {
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+					}
+				};
+
+				text.setPlaceholder(String(DEFAULT_SETTINGS.remoteTimeoutMs));
+				text.setValue(String(this.plugin.settings.remoteTimeoutMs));
+				text.inputEl.type = "number";
+				text.inputEl.min = "1000";
+				text.inputEl.step = "1000";
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("Batch Size")
+			.setDesc("批量 embedding 时单次请求携带的文本条数。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.remoteBatchSize;
+					const nextValue = this.parsePositiveIntegerInput(
+						text.getValue(),
+						DEFAULT_SETTINGS.remoteBatchSize,
+						1,
+					);
+					this.plugin.settings.remoteBatchSize = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"remote-batch-size",
+						() => {
+							this.plugin.settings.remoteBatchSize = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(String(previousValue));
+						return;
+					}
+
+					text.setValue(String(this.plugin.settings.remoteBatchSize));
+					if (this.plugin.settings.embeddingProvider === "remote") {
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+					}
+				};
+
+				text.setPlaceholder(String(DEFAULT_SETTINGS.remoteBatchSize));
+				text.setValue(String(this.plugin.settings.remoteBatchSize));
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.step = "1";
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		const testSetting = new Setting(containerEl)
+			.setName("Test Connection")
+			.setDesc("发送一次真实的 embeddings 请求，验证 Base URL、API Key、Model 是否可用。")
+			.addButton((btn) => {
+				btn.setButtonText("Test Connection").setCta().onClick(async () => {
+					btn.setButtonText("Testing...");
+					btn.setDisabled(true);
+
+					try {
+						await this.plugin.logRuntimeEvent(
+							"remote-embedding-test-requested",
+							"已开始测试远程 embeddings 接口。",
+							{
+								category: "embedding",
+								provider: "remote",
+								details: [
+									`base_url=${normalizeRemoteBaseUrl(this.plugin.settings.remoteBaseUrl) || "(empty)"}`,
+									`model=${this.plugin.settings.remoteModel}`,
+									`timeout_ms=${this.plugin.settings.remoteTimeoutMs}`,
+									`batch_size=${this.plugin.settings.remoteBatchSize}`,
+								],
+							},
+						);
+
+						this.plugin.embeddingService.switchProvider(this.plugin.settings);
+						const result = await this.plugin.embeddingService.testConnection();
+
+						testSetting.descEl.querySelector(".sc-api-test-result")?.remove();
+
+						const resultEl = testSetting.descEl.createEl("div", {
+							cls: "sc-api-test-result",
+						});
+
+						if (result.ok) {
+							resultEl.addClass("is-success");
+							resultEl.setText(`远程 embeddings 测试成功（维度：${result.dimension}）。`);
+							await this.plugin.logRuntimeEvent(
+								"remote-embedding-test-ok",
+								"远程 embeddings 接口测试成功。",
+								{
+									category: "embedding",
+									provider: "remote",
+									details: [
+										`base_url=${normalizeRemoteBaseUrl(this.plugin.settings.remoteBaseUrl) || "(empty)"}`,
+										`model=${this.plugin.settings.remoteModel}`,
+										`dimension=${result.dimension}`,
+									],
+								},
+							);
+						} else {
+							resultEl.addClass("is-error");
+							resultEl.setText(`远程 embeddings 测试失败：${result.error}`);
+							await this.plugin.logRuntimeEvent(
+								"remote-embedding-test-failed",
+								`远程 embeddings 接口测试失败：${result.error}`,
+								{
+									level: "warn",
+									category: "embedding",
+									provider: "remote",
+									details: [
+										`base_url=${normalizeRemoteBaseUrl(this.plugin.settings.remoteBaseUrl) || "(empty)"}`,
+										`model=${this.plugin.settings.remoteModel}`,
+									],
+								},
+							);
+							await this.plugin.logRuntimeError(
+								"remote-embedding-test",
+								result.diagnostic ?? result.error,
+								{
+									errorType: "runtime",
+									filePath: "__settings__/remote-embedding-test",
+									provider: "remote",
+								},
+							);
+						}
+					} catch (error) {
+						testSetting.descEl.querySelector(".sc-api-test-result")?.remove();
+						const resultEl = testSetting.descEl.createEl("div", {
+							cls: "sc-api-test-result",
+						});
+						const message = error instanceof Error ? error.message : String(error);
+						resultEl.addClass("is-error");
+						resultEl.setText(`远程 embeddings 测试失败：${message}`);
+						await this.plugin
+							.logRuntimeError("remote-embedding-test", error, {
+								errorType: "runtime",
+								filePath: "__settings__/remote-embedding-test",
+								provider: "remote",
+							})
+							.catch(() => undefined);
+					} finally {
+						btn.setButtonText("Test Connection");
+						btn.setDisabled(false);
+					}
+				});
+			});
 	}
 
 	private renderLocalModelSettings(containerEl: HTMLElement): void {
@@ -927,6 +1222,18 @@ export class SettingTab extends PluginSettingTab {
 		return new Date(timestamp).toLocaleString("zh-CN", {
 			hour12: false,
 		});
+	}
+
+	private parsePositiveIntegerInput(
+		value: string,
+		fallback: number,
+		minimum: number = 1,
+	): number {
+		const parsed = Number.parseInt(value.trim(), 10);
+		if (!Number.isInteger(parsed) || parsed < minimum) {
+			return fallback;
+		}
+		return parsed;
 	}
 
 	private async clearCurrentLocalModelCache(): Promise<{ removed: boolean; cachePath: string }> {
