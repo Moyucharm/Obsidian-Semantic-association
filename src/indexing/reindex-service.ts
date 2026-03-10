@@ -57,6 +57,7 @@ import { ChunkStore } from "../storage/chunk-store";
 import { VectorStore } from "../storage/vector-store";
 import type { IndexTask } from "./reindex-queue";
 import type { ErrorLogger } from "../utils/error-logger";
+import type { FailedTaskManager } from "./failed-task-manager";
 import {
 	createErrorFromDiagnostic,
 	mergeErrorDetails,
@@ -96,6 +97,7 @@ export class ReindexService {
 		private chunkStore: ChunkStore,
 		private vectorStore: VectorStore,
 		private errorLogger?: ErrorLogger,
+		private failedTaskManager?: FailedTaskManager,
 	) {}
 
 	/**
@@ -133,6 +135,9 @@ export class ReindexService {
 				await this.indexFile(files[i]);
 			} catch (err) {
 				failed++;
+				if (this.failedTaskManager && this.isRetryableIndexFailure(err)) {
+					this.failedTaskManager.markFailed(files[i].path, err);
+				}
 				// 记录到持久化错误日志
 				this.errorLogger?.log(
 					this.buildErrorLogEntry(files[i].path, err, ["index_mode=full"]),
@@ -149,6 +154,9 @@ export class ReindexService {
 		// 全量索引结束后统一保存错误日志（一次磁盘写入）
 		if (failed > 0 && this.errorLogger?.isDirty) {
 			await this.errorLogger.save();
+		}
+		if (this.failedTaskManager?.isDirty) {
+			await this.failedTaskManager.save();
 		}
 
 		console.log(
@@ -181,6 +189,17 @@ export class ReindexService {
 		// 就可以跳过 990 篇的 embedding 计算，节省大量时间和 API 调用。
 		const existing = this.noteStore.get(file.path);
 		if (existing && existing.hash === noteMeta.hash) {
+			// 内容未变：确保清理可能残留的 dirty/outdated 标记。
+			if (existing.dirty || existing.outdated) {
+				this.noteStore.set({
+					...noteMeta,
+					dirty: undefined,
+					outdated: undefined,
+				});
+			}
+			if (this.failedTaskManager?.resolve(file.path)) {
+				void this.failedTaskManager.save();
+			}
 			return; // 内容未变，跳过后续所有步骤
 		}
 
@@ -227,11 +246,13 @@ export class ReindexService {
 			}
 		}
 
-		// ── 步骤 6：生成 note-level embedding ──
-		// 使用 summaryText（前 500 字）生成整篇笔记的向量
-		// 这个向量用于 ConnectionsService 的第一阶段粗筛
-		let noteVector: NoteMeta["vector"] | undefined;
-		if (noteMeta.summaryText) {
+		// ── 步骤 6：生成 note-level 向量 ──
+		// 用 chunk 向量聚合出 note 向量，避免额外的远程请求，
+		// 同时让大笔记的表示更稳定（覆盖全篇而非仅前 500 字）。
+		// 这个向量用于 ConnectionsService 的第一阶段粗筛。
+		let noteVector: NoteMeta["vector"] | undefined = this.aggregateNoteVector(chunkVectors);
+		// 兜底：极少数情况下（无 chunks）仍可使用 summaryText 生成 note 向量。
+		if (!noteVector && noteMeta.summaryText) {
 			try {
 				noteVector = await this.embeddingService.embed(noteMeta.summaryText);
 			} catch (error) {
@@ -265,6 +286,10 @@ export class ReindexService {
 		// chunk-level 向量：id = chunkId（格式 path#order，含 #）
 		for (let i = 0; i < chunks.length; i++) {
 			this.vectorStore.set(chunks[i].chunkId, chunkVectors[i]);
+		}
+
+		if (this.failedTaskManager?.resolve(file.path)) {
+			void this.failedTaskManager.save();
 		}
 	}
 
@@ -304,18 +329,20 @@ export class ReindexService {
 						this.renameFile(task.oldPath, task.path);
 						const file = this.vault.getAbstractFileByPath(task.path);
 						if (file instanceof TFile) {
+							const content = await this.scanner.readContent(file);
+							const noteMeta = this.scanner.buildNoteMeta(file, content);
 							// rename 后必须刷新 NoteMeta：
 							// 即使内容 hash 没变，title 也可能因文件名变化而变化。
 							const existing = this.noteStore.get(file.path);
-							const content = await this.scanner.readContent(file);
-							const noteMeta = this.scanner.buildNoteMeta(file, content);
 
 							// 内容未变：只更新元数据，不重新计算 embedding（向量已在 renameFile 里迁移）
 							if (existing && existing.hash === noteMeta.hash) {
 								this.noteStore.set(noteMeta);
 							} else {
-								// 内容有变：走完整索引流程（会重建 chunk/embedding/vector）
-								await this.indexFile(file);
+								// 内容有变：仅标记 dirty/outdated，避免自动触发 embedding。
+								if (existing && !(existing.dirty || existing.outdated)) {
+									this.noteStore.set({ ...existing, dirty: true, outdated: true });
+								}
 							}
 						}
 					}
@@ -323,6 +350,10 @@ export class ReindexService {
 				}
 			}
 		} catch (err) {
+			if (this.failedTaskManager && this.isRetryableIndexFailure(err)) {
+				this.failedTaskManager.markFailed(task.path, err);
+				await this.failedTaskManager.save();
+			}
 			// 增量索引失败：即时持久化错误日志
 			if (this.errorLogger) {
 				const details = [`index_mode=incremental`, `task_type=${task.type}`];
@@ -375,12 +406,46 @@ export class ReindexService {
 		return heading ? `${heading}\n\n${chunk.text}` : chunk.text;
 	}
 
+	private aggregateNoteVector(chunkVectors: Vector[]): Vector | undefined {
+		if (chunkVectors.length === 0) {
+			return undefined;
+		}
+
+		const dimension = chunkVectors[0].length;
+		if (!Number.isInteger(dimension) || dimension <= 0) {
+			return undefined;
+		}
+
+		const sums = new Array<number>(dimension).fill(0);
+		let count = 0;
+
+		for (const vec of chunkVectors) {
+			if (vec.length !== dimension) {
+				continue;
+			}
+			for (let i = 0; i < dimension; i++) {
+				sums[i] += vec[i];
+			}
+			count++;
+		}
+
+		if (count === 0) {
+			return undefined;
+		}
+
+		const inv = 1 / count;
+		for (let i = 0; i < sums.length; i++) {
+			sums[i] *= inv;
+		}
+		return sums;
+	}
+
 	private normalizeChunksForEmbedding(notePath: string, chunks: ChunkMeta[]): ChunkMeta[] {
 		const normalizedChunks: ChunkMeta[] = [];
 
 		for (const chunk of chunks) {
 			const maxTextLength = this.getMaxChunkTextLength(chunk.heading);
-			const parts = this.splitTextForEmbedding(chunk.text, maxTextLength);
+			const parts = this.splitChunkForEmbedding(chunk, maxTextLength);
 			const sourceText = chunk.text.trim();
 			if (sourceText.length > 0 && parts.length === 0) {
 				throw this.createDiagnosticError(
@@ -400,7 +465,7 @@ export class ReindexService {
 			}
 
 			for (const part of parts) {
-				const text = part.trim();
+				const text = part.text.trim();
 				if (!text) {
 					continue;
 				}
@@ -411,6 +476,7 @@ export class ReindexService {
 					chunkId: `${notePath}#${order}`,
 					order,
 					text,
+					range: part.range,
 				};
 				const payload = this.buildChunkEmbeddingText(normalizedChunk);
 				if (!payload.trim()) {
@@ -453,6 +519,85 @@ export class ReindexService {
 		}
 
 		return normalizedChunks;
+	}
+
+	private splitChunkForEmbedding(
+		chunk: ChunkMeta,
+		limit: number,
+	): Array<{ text: string; range: [number, number] }> {
+		const rawText = chunk.text;
+		const trimmed = rawText.trim();
+		if (!trimmed) {
+			return [];
+		}
+
+		let startLine = chunk.range[0];
+		let endLine = chunk.range[1];
+
+		const trimStartText = rawText.trimStart();
+		const leadingRemoved = rawText.slice(0, rawText.length - trimStartText.length);
+		startLine += this.countNewlines(leadingRemoved);
+
+		const trimEndText = rawText.trimEnd();
+		const trailingRemoved = rawText.slice(trimEndText.length);
+		endLine = Math.max(startLine, endLine - this.countNewlines(trailingRemoved));
+
+		if (trimmed.length <= limit) {
+			return [{ text: trimmed, range: [startLine, endLine] }];
+		}
+
+		const parts: Array<{ text: string; range: [number, number] }> = [];
+		let remaining = trimmed;
+		let remainingStartLine = startLine;
+
+		while (remaining.length > limit) {
+			const splitPoint = this.findSplitPointForEmbedding(remaining, limit);
+			if (!Number.isInteger(splitPoint) || splitPoint <= 0 || splitPoint > remaining.length) {
+				throw this.createDiagnosticError("Chunk embedding split made no progress.", {
+					code: ERR_INDEX_CHUNK_SPLIT_STALLED,
+					stage: "chunk-embedding-split",
+					details: [`remaining_length=${remaining.length}`, `limit=${limit}`],
+				});
+			}
+
+			const rawSlice = remaining.slice(0, splitPoint);
+			const partText = rawSlice.trim();
+
+			if (!partText) {
+				const fallbackRaw = remaining.slice(0, limit);
+				const fallbackText = fallbackRaw.trim();
+				if (fallbackText) {
+					const range = this.computeTrimmedRange(remainingStartLine, fallbackRaw);
+					parts.push({ text: fallbackText, range: [range.startLine, range.endLine] });
+				}
+
+				const rawRemaining = remaining.slice(limit);
+				const baseStartLine = remainingStartLine + this.countNewlines(fallbackRaw);
+				const trimmedRemaining = this.trimStartWithLineOffset(rawRemaining, baseStartLine);
+				remaining = trimmedRemaining.text;
+				remainingStartLine = trimmedRemaining.startLine;
+				continue;
+			}
+
+			const range = this.computeTrimmedRange(remainingStartLine, rawSlice);
+			parts.push({ text: partText, range: [range.startLine, range.endLine] });
+
+			const rawRemaining = remaining.slice(splitPoint);
+			const baseStartLine = remainingStartLine + this.countNewlines(rawSlice);
+			const trimmedRemaining = this.trimStartWithLineOffset(rawRemaining, baseStartLine);
+			remaining = trimmedRemaining.text;
+			remainingStartLine = trimmedRemaining.startLine;
+		}
+
+		if (remaining) {
+			const finalText = remaining.trim();
+			if (finalText) {
+				const range = this.computeTrimmedRange(remainingStartLine, remaining);
+				parts.push({ text: finalText, range: [range.startLine, range.endLine] });
+			}
+		}
+
+		return parts.filter((part) => part.text.length > 0);
 	}
 
 	private getHeadingContextForEmbedding(heading: string): string {
@@ -538,6 +683,47 @@ export class ReindexService {
 		return normalizedParts;
 	}
 
+	private countNewlines(text: string): number {
+		let count = 0;
+		for (let index = 0; index < text.length; index++) {
+			if (text[index] === "\n") {
+				count++;
+			}
+		}
+		return count;
+	}
+
+	private computeTrimmedRange(
+		baseStartLine: number,
+		rawText: string,
+	): { startLine: number; endLine: number } {
+		const trimStartText = rawText.trimStart();
+		const leadingRemoved = rawText.slice(0, rawText.length - trimStartText.length);
+		const leadingNewlines = this.countNewlines(leadingRemoved);
+
+		const trimEndText = rawText.trimEnd();
+		const trailingRemoved = rawText.slice(trimEndText.length);
+		const trailingNewlines = this.countNewlines(trailingRemoved);
+
+		const rawNewlines = this.countNewlines(rawText);
+		return {
+			startLine: baseStartLine + leadingNewlines,
+			endLine: baseStartLine + rawNewlines - trailingNewlines,
+		};
+	}
+
+	private trimStartWithLineOffset(
+		rawText: string,
+		baseStartLine: number,
+	): { text: string; startLine: number } {
+		const trimmedText = rawText.trimStart();
+		const removed = rawText.slice(0, rawText.length - trimmedText.length);
+		return {
+			text: trimmedText,
+			startLine: baseStartLine + this.countNewlines(removed),
+		};
+	}
+
 	private findSplitPointForEmbedding(text: string, limit: number): number {
 		const softFloor = Math.max(
 			MIN_EMBEDDING_TEXT_LENGTH,
@@ -613,6 +799,9 @@ export class ReindexService {
 	}
 
 	private removeFile(path: string): void {
+		if (this.failedTaskManager?.resolve(path)) {
+			void this.failedTaskManager.save();
+		}
 		this.noteStore.delete(path);
 		this.chunkStore.deleteByNote(path);
 		this.vectorStore.delete(path);
@@ -626,15 +815,51 @@ export class ReindexService {
 	 * 每个 Store 都有 rename 方法来处理各自的数据格式。
 	 *
 	 * VectorStore.rename(oldPath, newPath) 会迁移：
-	 * - "old/path.md" → "new/path.md"
-	 * - "old/path.md#0" → "new/path.md#0"
-	 * - "old/path.md#1" → "new/path.md#1"
-	 * 因为它使用前缀匹配。
+	 * - note 向量："old/path.md" → "new/path.md"
+	 * - chunk 向量："old/path.md#0" → "new/path.md#0"
+	 * - chunk 向量："old/path.md#1" → "new/path.md#1"
+	 *
+	 * 注意：迁移 chunk 向量时必须以 `${oldPath}#` 作为前缀，
+	 * 避免把其他「路径以 oldPath 开头」的笔记误迁移（例如 "old/path.md copy.md"）。
 	 */
 	private renameFile(oldPath: string, newPath: string): void {
 		this.noteStore.rename(oldPath, newPath);
 		this.chunkStore.rename(oldPath, newPath);
-		this.vectorStore.rename(oldPath, newPath);
+		this.renameVectors(oldPath, newPath);
+		if (this.failedTaskManager?.rename(oldPath, newPath)) {
+			void this.failedTaskManager.save();
+		}
+	}
+
+	private renameVectors(oldPath: string, newPath: string): void {
+		const noteVector = this.vectorStore.get(oldPath);
+		if (noteVector) {
+			this.vectorStore.delete(oldPath);
+			this.vectorStore.set(newPath, noteVector);
+		}
+		this.vectorStore.rename(oldPath + "#", newPath + "#");
+	}
+
+	private isRetryableIndexFailure(err: unknown): boolean {
+		const diagnostic = normalizeErrorDiagnostic(err);
+		const code = (diagnostic.code ?? "").toUpperCase();
+
+		if (code === "ERR_REMOTE_REQUEST_NETWORK" || code === "ERR_REMOTE_REQUEST_TIMEOUT") {
+			return true;
+		}
+
+		const details = diagnostic.details ?? [];
+		if (code === "ERR_REMOTE_RESPONSE_STATUS") {
+			if (details.some((item) => item.toLowerCase().includes("status=429"))) {
+				return true;
+			}
+			if (/status\s*429\b/i.test(diagnostic.message)) {
+				return true;
+			}
+		}
+
+		// Fallback for wrapped errors that lost code/details.
+		return /\b429\b/.test(diagnostic.message);
 	}
 
 	/**

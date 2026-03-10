@@ -4,10 +4,9 @@
 
 这是一个 Obsidian 语义索引插件。
 
-当前 embedding 方案只有两种：
+历史上 embedding 方案有两种（remote/local），当前仅支持：
 
 - `remote`: OpenAI 兼容 `/v1/embeddings` 接口
-- `mock`: 开发测试用伪向量
 
 本地模型相关实现已经移除。
 
@@ -30,9 +29,9 @@
 
 - `src/settings.ts`
   - 设置页
-  - `remote/mock` provider 切换
   - 远程 API 配置
-  - Test Connection
+  - 关联视图配置（段落相似度阈值、每篇最多展示段落数）
+  - 测试连接
 
 - `src/embeddings/remote-provider.ts`
   - OpenAI 兼容 embeddings 请求
@@ -46,6 +45,10 @@
 
 - `src/storage/`
   - note/chunk/vector store
+
+- `src/search/`
+  - 关联推荐与语义搜索
+  - Connections 采用两阶段：note-level 召回（note 向量由 chunk 向量聚合）+ chunk-level 段落匹配（支持阈值筛选与多段返回）
 
 ## 开发约定
 
@@ -73,3 +76,7 @@ npm run build
 - `styles.css` 或 `dist/styles.css`
 
 不再有任何本地模型 worker 文件需要复制。
+
+说明：
+
+- 生产构建会先清理 `dist/`，再复制上述 3 个文件到 `dist/`。

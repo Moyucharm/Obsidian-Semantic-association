@@ -73,6 +73,10 @@ Current limits:
 
 These limits are local safety guards for indexing and are not remote model token limits.
 
+Note: `ReindexService` enforces the same `1200` character limit on the final embedding payload
+(`{heading}\n\n{text}`), so when a heading is present the allowed `text` length is reduced and the chunk
+may be split again during indexing.
+
 ## Heading Context
 
 Chunks still store:
@@ -92,6 +96,9 @@ When building the embedding payload, `ReindexService` sends:
 If a chunk has no heading, only the text is sent.
 
 This keeps rendered passage text clean while still letting embeddings use heading context.
+
+Heading context is truncated to 200 characters (with an ellipsis) before being prepended, to keep
+payloads bounded and avoid extremely long headings dominating embeddings.
 
 ## Remote Provider
 
@@ -152,9 +159,12 @@ Startup order in `src/main.ts`:
 
 1. loads runtime and error logs
 2. attempts to restore the saved index snapshot
-3. registers file events
+3. registers file events (used for incremental indexing when enabled)
 4. auto-opens the Connections view if configured
-5. triggers a full rebuild when needed
+5. reminds the user to rebuild the index when needed (no automatic full rebuild by default)
+
+The plugin tracks `lastFullRebuildAt` and shows a startup reminder when the last full rebuild is older
+than 7 days. Rebuilds are user-triggered (command or Settings UI) to avoid surprise remote API usage.
 
 ### Full Rebuild
 
@@ -168,21 +178,29 @@ Startup order in `src/main.ts`:
 
 ## Connections Ranking
 
-`ConnectionsService` uses a two-stage flow with a blended score:
+`ConnectionsService` retrieves related notes by searching chunk vectors directly and then aggregating
+chunk hits back to notes. This avoids "big note semantic dilution" where a note-level mean vector can
+become too generic to be recalled.
 
-1. retrieve note-level candidates
-2. rerank candidates using the best passage match
-3. compute:
+High-level flow:
 
-```text
-finalScore = noteScore * 0.7 + passageScore * 0.3
-```
+1. choose a query vector for the current note (prefer the persisted note-level vector; fall back to
+   the mean of current chunk vectors when missing)
+2. search across all chunk vectors (`id` contains `#`) and collect the topK chunk hits
+3. group hits by `notePath` (derived from `chunkId`)
+4. for each candidate note:
+   - filter passages by `minPassageScore`
+   - sort passages by similarity and truncate to `maxPassagesPerNote`
+   - compute `passageScore` using log-sum-exp aggregation (softmax pooling)
+   - rank notes using `finalScore = passageScore`
+   - expose `noteScore` as the best passage score for UI display
 
 `ConnectionResult` keeps:
 
-- `score`
-- `noteScore`
-- `passageScore`
+- `score` (finalScore)
+- `noteScore` (best passage score)
+- `passageScore` (aggregated)
+- `passages` (all matched passages after thresholding)
 
 ## Snapshot Compatibility
 
@@ -195,6 +213,7 @@ Snapshot compatibility checks include:
 - `remoteModel`
 - `embeddingDimension`
 - `chunkingStrategy`
+- `noteVectorStrategy`
 
 If any of these change, the snapshot is skipped and the user is asked to rebuild the index.
 
@@ -211,6 +230,6 @@ npm run build
 Build outputs:
 
 - `main.js`
-- `dist/main.js`
+- `dist/main.js` (dist is cleaned on production builds)
 - `dist/manifest.json`
 - `dist/styles.css`

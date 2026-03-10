@@ -28,6 +28,16 @@ export class LookupService {
 		private embeddingService: EmbeddingService,
 	) {}
 
+	private isExcludedPath(path: string, excludedFolders: string[]): boolean {
+		if (excludedFolders.length === 0) {
+			return false;
+		}
+
+		return excludedFolders.some((folder) => {
+			return path.startsWith(folder + "/") || path === folder;
+		});
+	}
+
 	/**
 	 * 执行语义搜索
 	 *
@@ -35,8 +45,13 @@ export class LookupService {
 	 * @param maxResults - 最大返回笔记数
 	 * @returns 按相关度降序排列的 LookupResult 列表
 	 */
-	async search(query: string, maxResults: number): Promise<LookupResult[]> {
+	async search(
+		query: string,
+		maxResults: number,
+		options?: { excludedFolders?: string[] },
+	): Promise<LookupResult[]> {
 		if (!query.trim()) return [];
+		const excludedFolders = options?.excludedFolders ?? [];
 
 		// 1. 为查询文本生成 embedding
 		const queryVector = await this.embeddingService.embed(query);
@@ -51,13 +66,34 @@ export class LookupService {
 
 		if (rawResults.length === 0) return [];
 
+		// 实时过滤：如果结果所属笔记在 excludedFolders 中，则剔除（无需重建索引）。
+		const filteredResults =
+			excludedFolders.length === 0
+				? rawResults
+				: rawResults.filter((result) => {
+						const hashIndex = result.id.lastIndexOf("#");
+						if (hashIndex === -1) {
+							return false;
+						}
+						const notePath = result.id.substring(0, hashIndex);
+						return !this.isExcludedPath(notePath, excludedFolders);
+					});
+
+		if (filteredResults.length === 0) {
+			return [];
+		}
+
 		// 3. 按笔记聚合：每篇笔记只保留最佳 chunk
-		const noteMap = this.aggregateByNote(rawResults);
+		const noteMap = this.aggregateByNote(filteredResults);
 
 		// 4. 构建并排序结果
 		const results: LookupResult[] = [];
 
 		for (const [notePath, best] of noteMap) {
+			if (this.isExcludedPath(notePath, excludedFolders)) {
+				continue;
+			}
+
 			const noteMeta = this.noteStore.get(notePath);
 			if (!noteMeta) continue;
 

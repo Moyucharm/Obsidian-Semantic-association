@@ -105,10 +105,10 @@ export class Scanner {
 			hash: hashContent(content),
 			tags: this.extractTags(cache),
 			outgoingLinks: this.extractLinks(cache),
-			// summaryText 用于生成 note-level embedding
+			// summaryText 用于元数据展示与 note-level 向量兜底生成（当无 chunks 时）。
 			// 取前 500 字而非全文，因为：
 			// 1. embedding 模型有 token 限制
-			// 2. 笔记开头通常是最能概括全文的部分
+			// 2. 作为兜底文本，前部摘要通常足够提供主题信号
 			summaryText: this.extractSummary(content),
 		};
 	}
@@ -192,12 +192,12 @@ export class Scanner {
 	}
 
 	/**
-	 * 提取摘要文本（用于生成 note-level embedding）
+	 * 提取摘要文本（用于元数据展示与 note-level 向量兜底生成）
 	 *
 	 * 策略：取正文前 500 字符（跳过 frontmatter）。
 	 *
 	 * 为什么是 500 字符？
-	 * - 太短（如 100 字）：信息不足，note-level 向量质量差
+	 * - 太短（如 100 字）：信息不足，兜底 note-level 向量质量差
 	 * - 太长（如全文）：embedding 模型有 token 限制（通常 8192），
 	 *   且长文本的 embedding 质量反而不如精简摘要
 	 * - 500 字符是一个平衡点，通常能覆盖笔记的核心主题

@@ -127,6 +127,20 @@ export class ReindexQueue {
 		this.resetDebounce();
 	}
 
+	/**
+	 * 立即执行当前队列中的任务（跳过防抖延迟）
+	 *
+	 * 主要用于设置页的“重试失败项”等手动触发场景。
+	 */
+	async flushNow(): Promise<void> {
+		if (this.debounceTimer) {
+			clearTimeout(this.debounceTimer);
+			this.debounceTimer = null;
+		}
+
+		await this.flush();
+	}
+
 	/** 当前待执行的任务数量 */
 	get pendingCount(): number {
 		return this.pending.size;

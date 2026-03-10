@@ -21,7 +21,7 @@ export class LookupView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return "Semantic Search";
+		return "语义搜索";
 	}
 
 	getIcon(): string {
@@ -37,7 +37,7 @@ export class LookupView extends ItemView {
 		});
 		this.searchInput = searchContainer.createEl("input", {
 			type: "text",
-			placeholder: "Enter text to run semantic search...",
+			placeholder: "输入文本以执行语义搜索...",
 			cls: "sc-search-input",
 		});
 
@@ -74,23 +74,24 @@ export class LookupView extends ItemView {
 		const requestId = ++this.searchRequestId;
 
 		if (this.plugin.noteStore.size === 0) {
-			this.renderMessage("The index is empty. Please run Rebuild Index first.");
+			this.renderMessage("索引为空，请先执行“重建索引”。");
 			return;
 		}
 
-		this.renderMessage("Searching...");
+		this.renderMessage("正在搜索...");
 
 		try {
 			const results = await this.plugin.lookupService.search(
 				query,
 				this.plugin.settings.maxConnections,
+				{ excludedFolders: this.plugin.settings.excludedFolders },
 			);
 			if (this.isStaleSearch(requestId, query)) {
 				return;
 			}
 
 			if (results.length === 0) {
-				this.renderMessage("No matching results found.");
+				this.renderMessage("未找到匹配结果。");
 			} else {
 				this.renderResults(results);
 			}
@@ -106,7 +107,7 @@ export class LookupView extends ItemView {
 					`max_results=${this.plugin.settings.maxConnections}`,
 				],
 			});
-			this.renderMessage("Search failed. Check the console or logs.");
+			this.renderMessage("搜索失败，请检查控制台或日志。");
 		}
 	}
 
@@ -150,7 +151,8 @@ export class LookupView extends ItemView {
 		});
 		titleEl.addEventListener("click", (event) => {
 			event.preventDefault();
-			this.app.workspace.openLinkText(result.notePath, "", false);
+			const range = this.plugin.chunkStore.get(result.passage.chunkId)?.range;
+			void this.plugin.openNoteInMainLeaf(result.notePath, range);
 		});
 
 		header.createEl("span", {
@@ -165,6 +167,10 @@ export class LookupView extends ItemView {
 
 		if (result.passage) {
 			const passageEl = item.createEl("div", { cls: "sc-result-passage" });
+			passageEl.addEventListener("click", () => {
+				const range = this.plugin.chunkStore.get(result.passage.chunkId)?.range;
+				void this.plugin.openNoteInMainLeaf(result.notePath, range);
+			});
 
 			if (result.passage.heading) {
 				passageEl.createEl("div", {

@@ -6,6 +6,12 @@ interface VectorStoreData {
 	dimension: number;
 }
 
+type VectorEntry = {
+	vector: Float32Array;
+	/** Precomputed 1 / ||vector|| to speed up cosine similarity. */
+	invNorm: number;
+};
+
 export interface VectorStoreBinaryMetadata {
 	version: number;
 	encoding: "float32-le";
@@ -30,7 +36,7 @@ const CURRENT_VERSION = 1;
 const CURRENT_BINARY_VERSION = 2;
 
 export class VectorStore {
-	private vectors: Map<string, Vector> = new Map();
+	private vectors: Map<string, VectorEntry> = new Map();
 	private dimension = 0;
 
 	load(raw: unknown): void {
@@ -45,18 +51,19 @@ export class VectorStore {
 			return;
 		}
 
-		const nextVectors = new Map<string, Vector>();
+		const nextVectors = new Map<string, VectorEntry>();
 		let nextDimension =
 			typeof data.dimension === "number" && Number.isInteger(data.dimension) && data.dimension > 0
 				? data.dimension
 				: 0;
 
 		for (const [id, vec] of Object.entries(data.vectors)) {
-			const validated = this.validateVector(vec, id, nextDimension);
+			const expectedDimension = nextDimension === 0 ? undefined : nextDimension;
+			const entry = this.createVectorEntry(vec, id, expectedDimension);
 			if (nextDimension === 0) {
-				nextDimension = validated.length;
+				nextDimension = entry.vector.length;
 			}
-			nextVectors.set(id, validated);
+			nextVectors.set(id, entry);
 		}
 
 		this.vectors = nextVectors;
@@ -65,8 +72,8 @@ export class VectorStore {
 
 	serialize(): VectorStoreData {
 		const vectors: Record<string, number[]> = {};
-		for (const [id, vec] of this.vectors) {
-			vectors[id] = vec;
+		for (const [id, entry] of this.vectors) {
+			vectors[id] = Array.from(entry.vector);
 		}
 
 		return {
@@ -79,19 +86,17 @@ export class VectorStore {
 	serializeBinary(): { metadata: VectorStoreBinaryMetadata; buffer: ArrayBuffer } {
 		const ids = Array.from(this.vectors.keys());
 		const buffer = new ArrayBuffer(ids.length * this.dimension * 4);
-		const view = new DataView(buffer);
-		let byteOffset = 0;
+		const floatView = new Float32Array(buffer);
+		let floatOffset = 0;
 
 		for (const id of ids) {
-			const vector = this.vectors.get(id);
-			if (!vector) {
+			const entry = this.vectors.get(id);
+			if (!entry) {
 				throw new Error(`VectorStore: missing vector for ${id} during binary serialization`);
 			}
 
-			for (const value of vector) {
-				view.setFloat32(byteOffset, value, true);
-				byteOffset += 4;
-			}
+			floatView.set(entry.vector, floatOffset);
+			floatOffset += this.dimension;
 		}
 
 		return {
@@ -141,21 +146,22 @@ export class VectorStore {
 			);
 		}
 
-		const view = new DataView(binary);
-		let byteOffset = 0;
+		const floats = new Float32Array(binary);
 
-		for (const id of metadata.ids) {
+		for (let index = 0; index < metadata.ids.length; index++) {
+			const id = metadata.ids[index];
 			if (typeof id !== "string" || id.length === 0) {
 				throw new Error("VectorStore: invalid vector id in binary metadata");
 			}
 
-			const vector = new Array<number>(metadata.dimension);
-			for (let i = 0; i < metadata.dimension; i++) {
-				vector[i] = view.getFloat32(byteOffset, true);
-				byteOffset += 4;
-			}
+			const start = index * metadata.dimension;
+			const end = start + metadata.dimension;
+			const vector = floats.subarray(start, end);
 
-			this.vectors.set(id, this.validateVector(vector, id, metadata.dimension));
+			this.vectors.set(id, {
+				vector,
+				invNorm: this.computeInvNorm(vector),
+			});
 		}
 
 		this.dimension = metadata.vectorCount > 0 ? metadata.dimension : 0;
@@ -183,12 +189,12 @@ export class VectorStore {
 
 	set(id: string, vector: Vector): void {
 		const expectedDimension = this.dimension === 0 ? undefined : this.dimension;
-		const validated = this.validateVector(vector, id, expectedDimension);
+		const entry = this.createVectorEntry(vector, id, expectedDimension);
 		if (this.dimension === 0) {
-			this.dimension = validated.length;
+			this.dimension = entry.vector.length;
 		}
 
-		this.vectors.set(id, validated);
+		this.vectors.set(id, entry);
 	}
 
 	setBatch(entries: Array<{ id: string; vector: Vector }>): void {
@@ -198,7 +204,8 @@ export class VectorStore {
 	}
 
 	get(id: string): Vector | undefined {
-		return this.vectors.get(id);
+		const entry = this.vectors.get(id);
+		return entry ? Array.from(entry.vector) : undefined;
 	}
 
 	delete(id: string): boolean {
@@ -218,18 +225,18 @@ export class VectorStore {
 	}
 
 	rename(oldPrefix: string, newPrefix: string): void {
-		const toMigrate: Array<{ oldId: string; newId: string; vector: Vector }> = [];
+		const toMigrate: Array<{ oldId: string; newId: string; entry: VectorEntry }> = [];
 
-		for (const [id, vec] of this.vectors) {
+		for (const [id, entry] of this.vectors) {
 			if (id.startsWith(oldPrefix)) {
 				const suffix = id.slice(oldPrefix.length);
-				toMigrate.push({ oldId: id, newId: newPrefix + suffix, vector: vec });
+				toMigrate.push({ oldId: id, newId: newPrefix + suffix, entry });
 			}
 		}
 
-		for (const { oldId, newId, vector } of toMigrate) {
+		for (const { oldId, newId, entry } of toMigrate) {
 			this.vectors.delete(oldId);
-			this.vectors.set(newId, vector);
+			this.vectors.set(newId, entry);
 		}
 	}
 
@@ -238,25 +245,101 @@ export class VectorStore {
 		topK: number,
 		filterFn?: (id: string) => boolean,
 	): VectorSearchResult[] {
+		if (!Number.isInteger(topK) || topK <= 0 || this.vectors.size === 0) {
+			return [];
+		}
+
 		if (this.dimension > 0 && query.length !== this.dimension) {
 			throw new Error(
 				`VectorStore: query dimension mismatch, expected ${this.dimension}, got ${query.length}`,
 			);
 		}
 
-		const results: VectorSearchResult[] = [];
+		const { vector: queryVector, invNorm: queryInvNorm } = this.createVectorEntry(
+			query,
+			"__query__",
+			this.dimension === 0 ? undefined : this.dimension,
+		);
+		if (!Number.isFinite(queryInvNorm) || queryInvNorm === 0) {
+			return [];
+		}
 
-		for (const [id, vec] of this.vectors) {
+		const limit = Math.min(topK, this.vectors.size);
+		const heap: VectorSearchResult[] = [];
+
+		const swap = (a: number, b: number): void => {
+			const tmp = heap[a];
+			heap[a] = heap[b];
+			heap[b] = tmp;
+		};
+
+		const siftUp = (index: number): void => {
+			let current = index;
+			while (current > 0) {
+				const parent = (current - 1) >> 1;
+				if (heap[parent].score <= heap[current].score) {
+					return;
+				}
+				swap(parent, current);
+				current = parent;
+			}
+		};
+
+		const siftDown = (index: number): void => {
+			let current = index;
+			while (true) {
+				const left = current * 2 + 1;
+				if (left >= heap.length) {
+					return;
+				}
+				const right = left + 1;
+				const smallest =
+					right < heap.length && heap[right].score < heap[left].score
+						? right
+						: left;
+				if (heap[current].score <= heap[smallest].score) {
+					return;
+				}
+				swap(current, smallest);
+				current = smallest;
+			}
+		};
+
+		for (const [id, entry] of this.vectors) {
 			if (filterFn && !filterFn(id)) {
 				continue;
 			}
 
-			const score = this.cosineSimilarity(query, vec);
-			results.push({ id, score });
+			const invNorm = entry.invNorm;
+			if (!Number.isFinite(invNorm) || invNorm === 0) {
+				continue;
+			}
+
+			const vec = entry.vector;
+			let dotProduct = 0;
+			for (let i = 0; i < vec.length; i++) {
+				dotProduct += queryVector[i] * vec[i];
+			}
+
+			const score = dotProduct * queryInvNorm * invNorm;
+			if (!Number.isFinite(score)) {
+				continue;
+			}
+			if (heap.length < limit) {
+				heap.push({ id, score });
+				siftUp(heap.length - 1);
+				continue;
+			}
+
+			if (score > heap[0].score) {
+				heap[0].id = id;
+				heap[0].score = score;
+				siftDown(0);
+			}
 		}
 
-		results.sort((a, b) => b.score - a.score);
-		return results.slice(0, topK);
+		heap.sort((a, b) => b.score - a.score);
+		return heap;
 	}
 
 	get size(): number {
@@ -268,17 +351,13 @@ export class VectorStore {
 		this.dimension = 0;
 	}
 
-	private validateVector(
+	private createVectorEntry(
 		vector: unknown,
 		id: string,
 		expectedDimension?: number,
-	): Vector {
+	): VectorEntry {
 		if (!Array.isArray(vector) || vector.length === 0) {
 			throw new Error(`VectorStore: invalid vector for ${id}`);
-		}
-
-		if (vector.some((value) => typeof value !== "number" || !Number.isFinite(value))) {
-			throw new Error(`VectorStore: non-finite vector value for ${id}`);
 		}
 
 		if (expectedDimension !== undefined && vector.length !== expectedDimension) {
@@ -287,35 +366,41 @@ export class VectorStore {
 			);
 		}
 
-		return vector;
+		const output = new Float32Array(vector.length);
+		let normSquared = 0;
+		for (let i = 0; i < vector.length; i++) {
+			const value = vector[i];
+			if (typeof value !== "number" || !Number.isFinite(value)) {
+				throw new Error(`VectorStore: non-finite vector value for ${id}`);
+			}
+			output[i] = value;
+			normSquared += value * value;
+		}
+
+		return {
+			vector: output,
+			invNorm: normSquared > 0 ? 1 / Math.sqrt(normSquared) : 0,
+		};
+	}
+
+	private computeInvNorm(vector: Float32Array): number {
+		let normSquared = 0;
+		for (let i = 0; i < vector.length; i++) {
+			const value = vector[i];
+			if (!Number.isFinite(value)) {
+				return 0;
+			}
+			normSquared += value * value;
+		}
+		if (!Number.isFinite(normSquared) || normSquared <= 0) {
+			return 0;
+		}
+		return 1 / Math.sqrt(normSquared);
 	}
 
 	private resetDimensionIfEmpty(): void {
 		if (this.vectors.size === 0) {
 			this.dimension = 0;
 		}
-	}
-
-	private cosineSimilarity(a: Vector, b: Vector): number {
-		if (a.length !== b.length) {
-			return 0;
-		}
-
-		let dotProduct = 0;
-		let normA = 0;
-		let normB = 0;
-
-		for (let i = 0; i < a.length; i++) {
-			dotProduct += a[i] * b[i];
-			normA += a[i] * a[i];
-			normB += b[i] * b[i];
-		}
-
-		const denominator = Math.sqrt(normA) * Math.sqrt(normB);
-		if (denominator === 0) {
-			return 0;
-		}
-
-		return dotProduct / denominator;
 	}
 }

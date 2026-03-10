@@ -4,7 +4,7 @@
  * 职责：
  * - 从候选笔记的 chunks 中选出与当前笔记最契合的一段文字
  * - 比较当前笔记的 chunk 向量与候选笔记的 chunk 向量
- * - 返回相似度最高的那个 chunk 作为 bestPassage
+ * - 支持按阈值筛选并返回多个候选段落（passages）
  *
  * 这是实现"不只展示相关笔记，还展示最契合段落"的核心模块。
  */
@@ -20,30 +20,30 @@ export class PassageSelector {
 	) {}
 
 	/**
-	 * 从候选笔记中选出最佳 passage
+	 * 从候选笔记中选出匹配的 passages
 	 *
 	 * 算法：
 	 * 1. 取候选笔记的所有 chunks
 	 * 2. 对每个候选 chunk，计算它与当前笔记所有 chunks 的最大相似度
-	 * 3. 选出最大相似度最高的那个候选 chunk
+	 * 3. 按阈值过滤后按分数降序排序，并截断到 maxResults
 	 *
 	 * @param candidateNotePath   - 候选笔记路径
 	 * @param currentChunkVectors - 当前笔记的所有 chunk 向量
-	 * @returns 最佳 passage，或 null（如候选笔记无 chunks）
+	 * @returns 匹配的 passages（可能为空）
 	 */
-	selectBest(
+	selectMatches(
 		candidateNotePath: string,
 		currentChunkVectors: Vector[],
-	): PassageResult | null {
+		options?: { minScore?: number; maxResults?: number },
+	): PassageResult[] {
 		const candidateChunks = this.chunkStore.getByNote(candidateNotePath);
 		if (candidateChunks.length === 0 || currentChunkVectors.length === 0) {
-			return null;
+			return [];
 		}
 
-		let bestScore = -Infinity;
-		let bestChunkId = "";
-		let bestHeading = "";
-		let bestText = "";
+		const minScore = options?.minScore ?? -Infinity;
+		const maxResults = options?.maxResults ?? 0;
+		const matches: PassageResult[] = [];
 
 		for (const chunk of candidateChunks) {
 			const chunkVector = this.vectorStore.get(chunk.chunkId);
@@ -52,22 +52,27 @@ export class PassageSelector {
 			// 计算该候选 chunk 与当前笔记所有 chunks 的最大相似度
 			const maxSim = this.maxSimilarity(chunkVector, currentChunkVectors);
 
-			if (maxSim > bestScore) {
-				bestScore = maxSim;
-				bestChunkId = chunk.chunkId;
-				bestHeading = chunk.heading;
-				bestText = chunk.text;
+			if (maxSim < minScore) {
+				continue;
 			}
+
+			matches.push({
+				chunkId: chunk.chunkId,
+				heading: chunk.heading,
+				text: chunk.text,
+				score: maxSim,
+			});
 		}
 
-		if (bestScore === -Infinity) return null;
+		if (matches.length === 0) {
+			return [];
+		}
 
-		return {
-			chunkId: bestChunkId,
-			heading: bestHeading,
-			text: bestText,
-			score: bestScore,
-		};
+		matches.sort((a, b) => b.score - a.score);
+		if (maxResults > 0) {
+			return matches.slice(0, maxResults);
+		}
+		return matches;
 	}
 
 	/**

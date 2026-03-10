@@ -2,13 +2,11 @@
  * Plugin settings UI.
  */
 
-import { App, Notice, PluginSettingTab, Setting } from "obsidian";
+import { App, Notice, PluginSettingTab, Setting, SliderComponent, TextComponent } from "obsidian";
 import type SemanticConnectionsPlugin from "./main";
 import {
 	DEFAULT_SETTINGS,
-	type IndexErrorEntry,
 	type RebuildIndexProgress,
-	type RuntimeLogEntry,
 } from "./types";
 import { normalizeRemoteBaseUrl } from "./embeddings/remote-provider";
 
@@ -24,12 +22,12 @@ export class SettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl("h2", { text: "Semantic Connections Settings" });
+		containerEl.createEl("h2", { text: "语义关联设置" });
 		this.renderRemoteSettings(containerEl);
 
 		new Setting(containerEl)
-			.setName("Excluded folders")
-			.setDesc("One folder path per line. These folders are skipped during indexing.")
+			.setName("排除文件夹")
+			.setDesc("每行填写一个文件夹路径。索引时会跳过这些文件夹。")
 			.addTextArea((text) =>
 				text
 					.setPlaceholder("templates\narchive")
@@ -45,23 +43,81 @@ export class SettingTab extends PluginSettingTab {
 						});
 						if (saved) {
 							new Notice(
-								"Excluded folders updated. Rebuild the index to apply them to existing data.",
+								"排除文件夹已更新。搜索/关联结果会立即过滤；若要从索引存储中彻底移除，请重建索引。",
 								6000,
 							);
 						}
 					}),
 			);
 
+		this.renderBehaviorSettings(containerEl);
+		this.renderConnectionsSettings(containerEl);
 		this.renderIndexManagement(containerEl);
-		this.renderLogSection(containerEl);
+	}
+
+	private renderBehaviorSettings(containerEl: HTMLElement): void {
+		containerEl.createEl("h3", { text: "行为" });
+
+		new Setting(containerEl)
+			.setName("启动时自动打开右侧关联视图")
+			.setDesc("开启后插件启动完成时会自动在右侧边栏创建“语义关联”视图（不会抢编辑器焦点）。")
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.autoOpenConnectionsView).onChange(async (value) => {
+					const previousValue = this.plugin.settings.autoOpenConnectionsView;
+					this.plugin.settings.autoOpenConnectionsView = value;
+					const saved = await this.saveSettingsOrRollback(
+						"auto-open-connections-view",
+						() => {
+							this.plugin.settings.autoOpenConnectionsView = previousValue;
+						},
+						{ refresh: false },
+					);
+
+					if (!saved) {
+						toggle.setValue(previousValue);
+						return;
+					}
+				}),
+			);
+
+		new Setting(containerEl)
+			.setName("监听文件变更（仅本地标记）")
+			.setDesc(
+				"开启后会监听笔记新增/修改/删除/重命名：新增/修改仅计算 Hash 并标记为待同步，不会自动调用 Embedding API。需要手动执行“同步变动笔记”或在关联视图点击“立即同步”才会消耗 API。",
+			)
+			.addToggle((toggle) =>
+				toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
+					const previousValue = this.plugin.settings.autoIndex;
+					this.plugin.settings.autoIndex = value;
+					const saved = await this.saveSettingsOrRollback(
+						"auto-index",
+						() => {
+							this.plugin.settings.autoIndex = previousValue;
+						},
+						{ refresh: false },
+					);
+
+					if (!saved) {
+						toggle.setValue(previousValue);
+						return;
+					}
+
+					new Notice(
+						value
+							? "已开启变动标记：文件变更将被标记为待同步（不自动调用 API）。"
+							: "已关闭变动标记：文件变更不会自动标记，可手动执行“同步变动笔记”。",
+						6000,
+					);
+				}),
+			);
 	}
 
 	private renderRemoteSettings(containerEl: HTMLElement): void {
-		containerEl.createEl("h3", { text: "Remote embeddings" });
+		containerEl.createEl("h3", { text: "远程嵌入" });
 
 		new Setting(containerEl)
-			.setName("API Base URL")
-			.setDesc("Requests are sent to {baseUrl}/v1/embeddings.")
+			.setName("API 基础 URL")
+			.setDesc("请求将发送到 {baseUrl}/v1/embeddings。")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteBaseUrl;
@@ -83,7 +139,7 @@ export class SettingTab extends PluginSettingTab {
 					this.plugin.embeddingService.switchProvider(this.plugin.settings);
 					if (previousValue !== nextValue) {
 						this.invalidateIndex(
-							"Remote API Base URL changed. The existing index was cleared. Please rebuild the index.",
+							"远程 API 基础 URL 已变更，现有索引已清空，请重新构建索引。",
 						);
 					}
 				};
@@ -97,8 +153,8 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("API Key")
-			.setDesc("Bearer token used for the remote embeddings API.")
+			.setName("API 密钥")
+			.setDesc("用于远程嵌入 API 的 Bearer Token。")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteApiKey;
@@ -130,8 +186,8 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Remote Model")
-			.setDesc("Dense embedding model name. Defaults to BAAI/bge-m3.")
+			.setName("远程模型")
+			.setDesc("稠密向量模型名称，默认使用 BAAI/bge-m3。")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteModel;
@@ -153,7 +209,7 @@ export class SettingTab extends PluginSettingTab {
 					this.plugin.embeddingService.switchProvider(this.plugin.settings);
 					if (previousValue !== nextValue) {
 						this.invalidateIndex(
-							"Remote model changed. The existing index was cleared. Please rebuild the index.",
+							"远程模型已变更，现有索引已清空，请重新构建索引。",
 						);
 					}
 				};
@@ -167,8 +223,8 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Timeout")
-			.setDesc("Remote request timeout in milliseconds.")
+			.setName("超时时间")
+			.setDesc("远程请求超时时间（毫秒）。")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteTimeoutMs;
@@ -205,8 +261,8 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		new Setting(containerEl)
-			.setName("Batch Size")
-			.setDesc("Maximum number of texts sent in one embeddings request.")
+			.setName("批大小")
+			.setDesc("单次嵌入请求最多发送的文本数量。")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteBatchSize;
@@ -243,17 +299,17 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		const testSetting = new Setting(containerEl)
-			.setName("Test Connection")
-			.setDesc("Send a real embeddings request to verify the current remote configuration.")
+			.setName("测试连接")
+			.setDesc("发送一次真实的嵌入请求，以验证当前远程配置。")
 			.addButton((btn) => {
-				btn.setButtonText("Test Connection").setCta().onClick(async () => {
-					btn.setButtonText("Testing...");
+				btn.setButtonText("测试连接").setCta().onClick(async () => {
+					btn.setButtonText("测试中...");
 					btn.setDisabled(true);
 
 					try {
 						await this.plugin.logRuntimeEvent(
 							"remote-embedding-test-requested",
-							"Started a remote embeddings connectivity test.",
+							"开始远程嵌入连通性测试。",
 							{
 								category: "embedding",
 								provider: "remote",
@@ -276,10 +332,10 @@ export class SettingTab extends PluginSettingTab {
 
 						if (result.ok) {
 							resultEl.addClass("is-success");
-							resultEl.setText(`Remote embeddings test succeeded. Dimension: ${result.dimension}.`);
+							resultEl.setText(`远程嵌入测试成功，向量维度：${result.dimension}。`);
 							await this.plugin.logRuntimeEvent(
 								"remote-embedding-test-ok",
-								"Remote embeddings test succeeded.",
+								"远程嵌入测试成功。",
 								{
 									category: "embedding",
 									provider: "remote",
@@ -292,10 +348,10 @@ export class SettingTab extends PluginSettingTab {
 							);
 						} else {
 							resultEl.addClass("is-error");
-							resultEl.setText(`Remote embeddings test failed: ${result.error}`);
+							resultEl.setText(`远程嵌入测试失败：${result.error}`);
 							await this.plugin.logRuntimeEvent(
 								"remote-embedding-test-failed",
-								`Remote embeddings test failed: ${result.error}`,
+								`远程嵌入测试失败：${result.error}`,
 								{
 									level: "warn",
 									category: "embedding",
@@ -323,7 +379,7 @@ export class SettingTab extends PluginSettingTab {
 						});
 						const message = error instanceof Error ? error.message : String(error);
 						resultEl.addClass("is-error");
-						resultEl.setText(`Remote embeddings test failed: ${message}`);
+						resultEl.setText(`远程嵌入测试失败：${message}`);
 						await this.plugin
 							.logRuntimeError("remote-embedding-test", error, {
 								errorType: "runtime",
@@ -332,31 +388,139 @@ export class SettingTab extends PluginSettingTab {
 							})
 							.catch(() => undefined);
 					} finally {
-						btn.setButtonText("Test Connection");
+						btn.setButtonText("测试连接");
 						btn.setDisabled(false);
 					}
 				});
 			});
 	}
 
+	private renderConnectionsSettings(containerEl: HTMLElement): void {
+		containerEl.createEl("h3", { text: "关联视图" });
+
+		let thresholdSlider: SliderComponent | null = null;
+		let thresholdInput: TextComponent | null = null;
+
+		const syncThresholdControls = (value: number): void => {
+			thresholdSlider?.setValue(value);
+			thresholdInput?.setValue(String(value));
+		};
+
+		const commitThreshold = async (raw: number): Promise<void> => {
+			const previousValue = this.plugin.settings.minSimilarityScore;
+			const nextValue = Math.max(0, Math.min(1, raw));
+			this.plugin.settings.minSimilarityScore = nextValue;
+
+			const saved = await this.saveSettingsOrRollback(
+				"min-similarity-score",
+				() => {
+					this.plugin.settings.minSimilarityScore = previousValue;
+				},
+				{ refresh: false },
+			);
+
+			if (!saved) {
+				syncThresholdControls(previousValue);
+				return;
+			}
+
+			syncThresholdControls(this.plugin.settings.minSimilarityScore);
+		};
+
+		new Setting(containerEl)
+			.setName("匹配阈值")
+			.setDesc(
+				"范围 0.0–1.0。阈值越高越严格（更少结果），越低越宽松（更灵敏、更多结果）。无论阈值多高，仍会展示最相关的前 5 条，并将低于阈值的结果标为“弱关联”。",
+			)
+			.addSlider((slider) => {
+				thresholdSlider = slider;
+				slider
+					.setLimits(0, 1, 0.01)
+					.setValue(this.plugin.settings.minSimilarityScore)
+					.setInstant(false)
+					.onChange((value) => {
+						void commitThreshold(value);
+					});
+			})
+			.addText((text) => {
+				thresholdInput = text;
+				const commit = async (): Promise<void> => {
+					const nextValue = this.parseNumberInRangeInput(
+						text.getValue(),
+						DEFAULT_SETTINGS.minSimilarityScore,
+						0,
+						1,
+					);
+					await commitThreshold(nextValue);
+				};
+
+				text.setPlaceholder(String(DEFAULT_SETTINGS.minSimilarityScore));
+				text.setValue(String(this.plugin.settings.minSimilarityScore));
+				text.inputEl.type = "number";
+				text.inputEl.min = "0";
+				text.inputEl.max = "1";
+				text.inputEl.step = "0.01";
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName("每篇笔记最多展示段落数")
+			.setDesc("0 表示不限制。")
+			.addText((text) => {
+				const commit = async (): Promise<void> => {
+					const previousValue = this.plugin.settings.maxPassagesPerNote;
+					const nextValue = this.parsePositiveIntegerInput(
+						text.getValue(),
+						DEFAULT_SETTINGS.maxPassagesPerNote,
+						0,
+					);
+					this.plugin.settings.maxPassagesPerNote = nextValue;
+					const saved = await this.saveSettingsOrRollback(
+						"max-passages-per-note",
+						() => {
+							this.plugin.settings.maxPassagesPerNote = previousValue;
+						},
+						{ refresh: false },
+					);
+					if (!saved) {
+						text.setValue(String(previousValue));
+						return;
+					}
+
+					text.setValue(String(this.plugin.settings.maxPassagesPerNote));
+				};
+
+				text.setPlaceholder(String(DEFAULT_SETTINGS.maxPassagesPerNote));
+				text.setValue(String(this.plugin.settings.maxPassagesPerNote));
+				text.inputEl.type = "number";
+				text.inputEl.min = "0";
+				text.inputEl.step = "1";
+				text.inputEl.addEventListener("change", () => {
+					void commit();
+				});
+			});
+	}
+
 	private renderIndexManagement(containerEl: HTMLElement): void {
-		containerEl.createEl("h2", { text: "Index Management" });
+		containerEl.createEl("h2", { text: "索引管理" });
 
 		const rebuildSetting = new Setting(containerEl)
-			.setName("Rebuild Index")
+			.setName("重建索引")
 			.setDesc("")
 			.addButton((btn) => {
 				const resetButton = (): void => {
-					btn.setButtonText(this.plugin.isRebuilding ? "Rebuilding..." : "Rebuild");
+					btn.setButtonText(this.plugin.isRebuilding ? "重建中..." : "重建");
 					btn.setDisabled(this.plugin.isRebuilding);
 				};
 
 				btn.setCta().onClick(async () => {
-					btn.setButtonText("Rebuilding...");
+					btn.setButtonText("重建中...");
 					btn.setDisabled(true);
 					updateRebuildProgress({
 						stage: "preparing",
-						message: "Preparing to rebuild the index...",
+						message: "正在准备重建索引...",
 						percent: 0,
 					});
 
@@ -372,7 +536,7 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		rebuildSetting.addButton((btn) => {
-			btn.setButtonText("Storage Stats").onClick(async () => {
+			btn.setButtonText("存储统计").onClick(async () => {
 				btn.setDisabled(true);
 				try {
 					await this.plugin.showIndexStorageSummary();
@@ -385,9 +549,6 @@ export class SettingTab extends PluginSettingTab {
 		rebuildSetting.descEl.empty();
 
 		const rebuildSummaryEl = rebuildSetting.descEl.createDiv();
-		const rebuildErrorHintEl = rebuildSetting.descEl.createDiv({
-			cls: "sc-setting-error-hint",
-		});
 		const rebuildStatusEl = rebuildSetting.descEl.createDiv({
 			cls: "sc-rebuild-status",
 		});
@@ -412,21 +573,16 @@ export class SettingTab extends PluginSettingTab {
 		const updateIndexSummary = (): void => {
 			const noteCount = this.plugin.noteStore.size;
 			const chunkCount = this.plugin.chunkStore.size;
-			rebuildSummaryEl.setText(
+			const lastFullRebuildAt = this.plugin.settings.lastFullRebuildAt;
+			const lastRebuildText =
+				lastFullRebuildAt > 0
+					? `上次全量重建：${new Date(lastFullRebuildAt).toLocaleString()}`
+					: "上次全量重建：未记录";
+			const summary =
 				noteCount > 0
-					? `Indexed ${noteCount} notes and ${chunkCount} chunks.`
-					: "No index data available.",
-			);
-
-			const errorCount = this.plugin.errorLogger.size;
-			if (errorCount > 0) {
-				rebuildErrorHintEl.setText(`Error log entries: ${errorCount}`);
-				rebuildErrorHintEl.style.display = "";
-				return;
-			}
-
-			rebuildErrorHintEl.empty();
-			rebuildErrorHintEl.style.display = "none";
+					? `已索引 ${noteCount} 篇笔记，${chunkCount} 个语义分块。`
+					: "当前没有索引数据。";
+			rebuildSummaryEl.setText(`${summary}\n${lastRebuildText}`);
 		};
 
 		const updateRebuildProgress = (progress: RebuildIndexProgress): void => {
@@ -450,10 +606,10 @@ export class SettingTab extends PluginSettingTab {
 				details.push(progress.file);
 			}
 			if (typeof progress.indexedNotes === "number") {
-				details.push(`indexed=${progress.indexedNotes}`);
+				details.push(`已索引 ${progress.indexedNotes}`);
 			}
 			if (typeof progress.failed === "number" && progress.failed > 0) {
-				details.push(`failed=${progress.failed}`);
+				details.push(`失败 ${progress.failed}`);
 			}
 
 			if (details.length > 0) {
@@ -465,80 +621,33 @@ export class SettingTab extends PluginSettingTab {
 			}
 		};
 
+		new Setting(containerEl)
+			.setName("重试失败项")
+			.setDesc(
+				`重试因网络中断或 429 限流导致索引失败的文件（当前：${this.plugin.failedTaskManager.size} 项）。`,
+			)
+			.addButton((btn) => {
+				const resetButton = (): void => {
+					btn.setButtonText("重试失败项");
+					btn.setDisabled(this.plugin.isRebuilding || this.plugin.failedTaskManager.size === 0);
+				};
+
+				btn.setCta().onClick(async () => {
+					btn.setButtonText("重试中...");
+					btn.setDisabled(true);
+					try {
+						await this.plugin.retryFailedIndexTasks();
+					} finally {
+						this.display();
+					}
+				});
+
+				resetButton();
+			});
+
 		updateIndexSummary();
 		rebuildStatusEl.style.display = "none";
 		rebuildDetailEl.style.display = "none";
-	}
-
-	private renderLogSection(containerEl: HTMLElement): void {
-		containerEl.createEl("h2", { text: "Logs" });
-
-		const runtimeSetting = new Setting(containerEl)
-			.setName("Runtime log")
-			.setDesc("Show the most recent 30 runtime log entries.")
-			.addButton((btn) => {
-				btn.setButtonText("Refresh").onClick(() => {
-					renderRuntimeLog();
-				});
-			})
-			.addButton((btn) => {
-				btn.setButtonText("Clear").onClick(async () => {
-					btn.setDisabled(true);
-					try {
-						await this.plugin.clearRuntimeLogs();
-						renderRuntimeLog();
-					} catch {
-						new Notice("Failed to clear runtime logs. Check the error log.", 6000);
-					} finally {
-						btn.setDisabled(false);
-					}
-				});
-			});
-
-		const runtimeLogOutputEl = runtimeSetting.descEl.createEl("pre", {
-			cls: "sc-log-output",
-		});
-
-		const errorSetting = new Setting(containerEl)
-			.setName("Error log")
-			.setDesc("Show the most recent 20 error log entries.")
-			.addButton((btn) => {
-				btn.setButtonText("Refresh").onClick(() => {
-					renderErrorLog();
-				});
-			})
-			.addButton((btn) => {
-				btn.setButtonText("Clear").onClick(async () => {
-					btn.setDisabled(true);
-					try {
-						await this.plugin.clearErrorLogs();
-						renderErrorLog();
-					} catch {
-						new Notice("Failed to clear error logs. Check the runtime log.", 6000);
-					} finally {
-						btn.setDisabled(false);
-					}
-				});
-			});
-
-		const errorLogOutputEl = errorSetting.descEl.createEl("pre", {
-			cls: "sc-log-output",
-		});
-
-		const renderRuntimeLog = (): void => {
-			runtimeLogOutputEl.setText(
-				this.formatRuntimeLogEntries(this.plugin.getRecentRuntimeLogs(30)),
-			);
-		};
-
-		const renderErrorLog = (): void => {
-			errorLogOutputEl.setText(
-				this.formatErrorLogEntries(this.plugin.errorLogger.getRecent(20)),
-			);
-		};
-
-		renderRuntimeLog();
-		renderErrorLog();
 	}
 
 	private invalidateIndex(message: string): void {
@@ -559,63 +668,12 @@ export class SettingTab extends PluginSettingTab {
 			return true;
 		} catch {
 			rollback();
-			new Notice(options.failureMessage ?? "Failed to save settings. Check the error log.", 6000);
+			new Notice(options.failureMessage ?? "保存设置失败，请检查错误日志。", 6000);
 			if (options.refresh ?? true) {
 				this.display();
 			}
 			return false;
 		}
-	}
-
-	private formatRuntimeLogEntries(entries: RuntimeLogEntry[]): string {
-		if (entries.length === 0) {
-			return "No runtime logs.";
-		}
-
-		return entries
-			.map((entry) => {
-				const header = `[${this.formatLogTimestamp(entry.timestamp)}] ${entry.level.toUpperCase()} ${entry.event}`;
-				const lines = [header, `  ${entry.message}`];
-				const meta = [entry.category, entry.provider].filter((item): item is string => Boolean(item));
-				if (meta.length > 0) {
-					lines.push(`  ${meta.join(" | ")}`);
-				}
-				if (entry.details && entry.details.length > 0) {
-					lines.push(...entry.details.map((detail) => `  - ${detail}`));
-				}
-				return lines.join("\n");
-			})
-			.join("\n\n");
-	}
-
-	private formatErrorLogEntries(entries: IndexErrorEntry[]): string {
-		if (entries.length === 0) {
-			return "No error logs.";
-		}
-
-		return entries
-			.map((entry) => {
-				const header = `[${this.formatLogTimestamp(entry.timestamp)}] ${entry.errorType} ${entry.filePath}`;
-				const lines = [header, `  ${entry.message}`];
-				const meta = [
-					entry.provider ? `provider=${entry.provider}` : undefined,
-					entry.stage ? `stage=${entry.stage}` : undefined,
-				].filter((item): item is string => Boolean(item));
-				if (meta.length > 0) {
-					lines.push(`  ${meta.join(" | ")}`);
-				}
-				if (entry.details && entry.details.length > 0) {
-					lines.push(...entry.details.map((detail) => `  - ${detail}`));
-				}
-				return lines.join("\n");
-			})
-			.join("\n\n");
-	}
-
-	private formatLogTimestamp(timestamp: number): string {
-		return new Date(timestamp).toLocaleString("zh-CN", {
-			hour12: false,
-		});
 	}
 
 	private parsePositiveIntegerInput(
@@ -625,6 +683,22 @@ export class SettingTab extends PluginSettingTab {
 	): number {
 		const parsed = Number.parseInt(value.trim(), 10);
 		if (!Number.isInteger(parsed) || parsed < minimum) {
+			return fallback;
+		}
+		return parsed;
+	}
+
+	private parseNumberInRangeInput(
+		value: string,
+		fallback: number,
+		minimum: number,
+		maximum: number,
+	): number {
+		const parsed = Number.parseFloat(value.trim());
+		if (!Number.isFinite(parsed)) {
+			return fallback;
+		}
+		if (parsed < minimum || parsed > maximum) {
 			return fallback;
 		}
 		return parsed;

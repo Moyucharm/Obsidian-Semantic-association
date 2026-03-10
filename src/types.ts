@@ -38,6 +38,12 @@ export interface NoteMeta {
 	title: string;
 	mtime: number;
 	hash: string;
+	/**
+	 * 内容已变更但尚未重新索引（仅本地标记，不触发自动 embedding）。
+	 * dirty/outdated 语义等价：outdated 为兼容字段。
+	 */
+	dirty?: boolean;
+	outdated?: boolean;
 	tags: string[];
 	outgoingLinks: string[];
 	summaryText: string;
@@ -50,6 +56,11 @@ export interface ChunkMeta {
 	heading: string;
 	text: string;
 	order: number;
+	/**
+	 * 0-based line range [startLine, endLine] in the source note.
+	 * Used for precise navigation from search results.
+	 */
+	range: [number, number];
 	vector?: Vector;
 }
 
@@ -60,6 +71,7 @@ export interface ConnectionResult {
 	noteScore: number;
 	passageScore: number;
 	bestPassage: PassageResult;
+	passages: PassageResult[];
 }
 
 export interface PassageResult {
@@ -78,10 +90,18 @@ export interface LookupResult {
 
 export interface SemanticConnectionsSettings {
 	maxConnections: number;
+	minSimilarityScore: number;
+	maxPassagesPerNote: number;
 	excludedFolders: string[];
 	embeddingProvider: "remote";
 	autoIndex: boolean;
 	autoOpenConnectionsView: boolean;
+	/**
+	 * 上次全量重建索引的时间戳（毫秒）。
+	 *
+	 * 用于启动时的“索引过期提醒”（例如 7 天未重建则提示用户）。
+	 */
+	lastFullRebuildAt: number;
 	remoteBaseUrl: string;
 	remoteApiKey: string;
 	remoteModel: string;
@@ -151,10 +171,13 @@ export interface IndexStorageSummary {
 
 export const DEFAULT_SETTINGS: SemanticConnectionsSettings = {
 	maxConnections: 20,
+	minSimilarityScore: 0.25,
+	maxPassagesPerNote: 5,
 	excludedFolders: [],
 	embeddingProvider: "remote",
-	autoIndex: true,
+	autoIndex: false,
 	autoOpenConnectionsView: true,
+	lastFullRebuildAt: 0,
 	remoteBaseUrl: "",
 	remoteApiKey: "",
 	remoteModel: "BAAI/bge-m3",

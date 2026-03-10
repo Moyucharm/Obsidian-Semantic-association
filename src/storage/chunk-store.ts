@@ -36,7 +36,7 @@
  *   Chunker.chunk() → ReindexService.indexFile() → ChunkStore.replaceByNote()
  *
  * 读取路径（Connections 场景）：
- *   ConnectionsService → PassageSelector.selectBest()
+ *   ConnectionsService → PassageSelector.selectMatches()
  *     → ChunkStore.getByNote(candidatePath)  // 取候选笔记的所有 chunks
  *
  * 读取路径（Lookup 场景）：

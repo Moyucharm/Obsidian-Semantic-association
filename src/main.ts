@@ -2,7 +2,7 @@
  * Plugin entrypoint.
  */
 
-import { Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
+import { MarkdownView, Notice, Plugin, TAbstractFile, TFile, WorkspaceLeaf } from "obsidian";
 import {
 	DEFAULT_SETTINGS,
 	type IndexErrorEntry,
@@ -16,6 +16,7 @@ import {
 import { EmbeddingService } from "./embeddings/embedding-service";
 import { normalizeRemoteBaseUrl } from "./embeddings/remote-provider";
 import { Chunker } from "./indexing/chunker";
+import { FailedTaskManager } from "./indexing/failed-task-manager";
 import { ReindexQueue } from "./indexing/reindex-queue";
 import { ReindexService } from "./indexing/reindex-service";
 import { Scanner } from "./indexing/scanner";
@@ -27,9 +28,11 @@ import { NoteStore } from "./storage/note-store";
 import { VectorStore } from "./storage/vector-store";
 import { mergeErrorDetails, normalizeErrorDiagnostic } from "./utils/error-utils";
 import { ErrorLogger } from "./utils/error-logger";
+import { hashContent } from "./utils/hash";
 import { RuntimeLogger } from "./utils/runtime-logger";
 import { ConnectionsView, VIEW_TYPE_CONNECTIONS } from "./views/connections-view";
 import { LookupView, VIEW_TYPE_LOOKUP } from "./views/lookup-view";
+import { SyncChangedNotesModal } from "./views/sync-changed-notes-modal";
 
 type RuntimeErrorLogOptions = {
 	errorType?: IndexErrorEntry["errorType"];
@@ -53,11 +56,13 @@ type RebuildIndexOptions = {
 type PersistedIndexSnapshot = {
 	version: number;
 	savedAt?: number;
+	lastFullRebuildAt?: number;
 	embeddingProvider?: string;
 	embeddingDimension?: number;
 	remoteBaseUrl?: string;
 	remoteModel?: string;
 	chunkingStrategy?: string;
+	noteVectorStrategy?: string;
 	vectorBinaryPath?: string;
 	noteStore?: unknown;
 	chunkStore?: unknown;
@@ -66,6 +71,9 @@ type PersistedIndexSnapshot = {
 
 const CURRENT_INDEX_SNAPSHOT_VERSION = 3;
 const CURRENT_CHUNKING_STRATEGY = "paragraph-first-v2";
+const CURRENT_NOTE_VECTOR_STRATEGY = "chunk-mean-v1";
+const FULL_REBUILD_REMINDER_DAYS = 7;
+const MS_PER_DAY = 86_400_000;
 
 export default class SemanticConnectionsPlugin extends Plugin {
 	settings: SemanticConnectionsSettings = DEFAULT_SETTINGS;
@@ -78,6 +86,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	lookupService!: LookupService;
 	errorLogger!: ErrorLogger;
 	runtimeLogger!: RuntimeLogger;
+	failedTaskManager!: FailedTaskManager;
 
 	private scanner!: Scanner;
 	private chunker!: Chunker;
@@ -92,36 +101,63 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	private indexSnapshotIncompatible = false;
 
 	isRebuilding = false;
+	isSyncing = false;
+	private indexVersionValue = 0;
+
+	private dirtyCheckTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
+	get indexVersion(): number {
+		return this.indexVersionValue;
+	}
 
 	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.createServices();
+		await this.failedTaskManager.load();
 		this.registerGlobalErrorHandlers();
 
 		this.registerView(VIEW_TYPE_CONNECTIONS, (leaf) => new ConnectionsView(leaf, this));
 		this.registerView(VIEW_TYPE_LOOKUP, (leaf) => new LookupView(leaf, this));
 
+		this.addRibbonIcon("link", "Show Connections View", () => {
+			void this.activateView(VIEW_TYPE_CONNECTIONS);
+		});
+
 		this.addCommand({
 			id: "open-connections-view",
-			name: "Open Connections View",
+			name: "打开关联视图",
+			callback: () => this.activateView(VIEW_TYPE_CONNECTIONS),
+		});
+
+		this.addCommand({
+			id: "show-connections-view",
+			name: "Show Connections View",
 			callback: () => this.activateView(VIEW_TYPE_CONNECTIONS),
 		});
 
 		this.addCommand({
 			id: "open-lookup-view",
-			name: "Open Semantic Search",
+			name: "打开语义搜索",
 			callback: () => this.activateView(VIEW_TYPE_LOOKUP),
 		});
 
 		this.addCommand({
 			id: "rebuild-index",
-			name: "Rebuild Index",
+			name: "重建索引",
 			callback: () => this.rebuildIndex(),
 		});
 
 		this.addCommand({
+			id: "sync-changed-notes",
+			name: "Sync Changed Notes（同步变动笔记）",
+			callback: () => {
+				void this.syncChangedNotes();
+			},
+		});
+
+		this.addCommand({
 			id: "show-index-storage-summary",
-			name: "Show Index Storage Summary",
+			name: "查看索引存储统计",
 			callback: () => {
 				void this.showIndexStorageSummary();
 			},
@@ -141,12 +177,14 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 	onunload(): void {
 		this.reindexQueue?.clear();
+		this.clearDirtyCheckTimers();
 		this.cancelIndexSaveTimer();
 		this.indexSavePending = true;
 		void this.flushIndexSave();
 		void this.embeddingService?.disposeCurrentProvider().catch(() => undefined);
 		void this.runtimeLogger?.save();
 		void this.errorLogger?.save();
+		void this.failedTaskManager?.save();
 	}
 
 	async loadSettings(): Promise<void> {
@@ -154,12 +192,26 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			| (Partial<SemanticConnectionsSettings> & Record<string, unknown>)
 			| null;
 		const loaded = raw ?? {};
+		const legacyMinPassageScore = loaded["minPassageScore"];
+		const minSimilarityScoreRaw =
+			typeof loaded.minSimilarityScore === "number" && Number.isFinite(loaded.minSimilarityScore)
+				? loaded.minSimilarityScore
+				: typeof legacyMinPassageScore === "number" && Number.isFinite(legacyMinPassageScore)
+					? legacyMinPassageScore
+					: DEFAULT_SETTINGS.minSimilarityScore;
 
 		this.settings = {
 			maxConnections:
 				typeof loaded.maxConnections === "number"
 					? loaded.maxConnections
 					: DEFAULT_SETTINGS.maxConnections,
+			minSimilarityScore: Math.max(0, Math.min(1, minSimilarityScoreRaw)),
+			maxPassagesPerNote:
+				typeof loaded.maxPassagesPerNote === "number" &&
+				Number.isInteger(loaded.maxPassagesPerNote) &&
+				loaded.maxPassagesPerNote >= 0
+					? loaded.maxPassagesPerNote
+					: DEFAULT_SETTINGS.maxPassagesPerNote,
 			excludedFolders: Array.isArray(loaded.excludedFolders)
 				? loaded.excludedFolders.filter((folder): folder is string => typeof folder === "string")
 				: DEFAULT_SETTINGS.excludedFolders,
@@ -172,6 +224,12 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				typeof loaded.autoOpenConnectionsView === "boolean"
 					? loaded.autoOpenConnectionsView
 					: DEFAULT_SETTINGS.autoOpenConnectionsView,
+			lastFullRebuildAt:
+				typeof loaded.lastFullRebuildAt === "number" &&
+				Number.isFinite(loaded.lastFullRebuildAt) &&
+				loaded.lastFullRebuildAt > 0
+					? loaded.lastFullRebuildAt
+					: DEFAULT_SETTINGS.lastFullRebuildAt,
 			remoteBaseUrl:
 				typeof loaded.remoteBaseUrl === "string"
 					? loaded.remoteBaseUrl.trim()
@@ -216,10 +274,22 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		}
 	}
 
+	private bumpIndexVersion(reason: string): void {
+		this.indexVersionValue++;
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CONNECTIONS);
+		for (const leaf of leaves) {
+			const view = leaf.view;
+			if (view instanceof ConnectionsView) {
+				view.onIndexVersionChanged(this.indexVersionValue, reason);
+			}
+		}
+	}
+
 	clearIndexData(): void {
 		this.noteStore.clear();
 		this.chunkStore.clear();
 		this.vectorStore.clear();
+		this.bumpIndexVersion("index-cleared");
 	}
 
 	async logRuntimeError(
@@ -289,7 +359,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				throw new Error("Error log clear was not persisted.");
 			}
 		} catch (error) {
-			await this.logRuntimeEvent("error-log-clear-failed", "Failed to clear the error log.", {
+			await this.logRuntimeEvent("error-log-clear-failed", "清空错误日志失败。", {
 				level: "warn",
 				category: "storage",
 				details: [
@@ -363,6 +433,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		this.errorLogger = new ErrorLogger(this.app.vault.adapter, logPath);
 		const runtimeLogPath = this.getPluginDataPath("runtime-log.json");
 		this.runtimeLogger = new RuntimeLogger(this.app.vault.adapter, runtimeLogPath);
+		const failedTaskPath = this.getPluginDataPath("failed-tasks.json");
+		this.failedTaskManager = new FailedTaskManager(this.app.vault.adapter, failedTaskPath);
 
 		this.noteStore = new NoteStore();
 		this.chunkStore = new ChunkStore();
@@ -381,6 +453,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			this.chunkStore,
 			this.vectorStore,
 			this.errorLogger,
+			this.failedTaskManager,
 		);
 
 		this.reindexQueue = new ReindexQueue();
@@ -411,7 +484,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		await this.errorLogger.cleanupIfNeeded();
 		await this.runtimeLogger.load();
 		await this.runtimeLogger.cleanupIfNeeded();
-		await this.logRuntimeEvent("startup-sequence-started", "Plugin entered the layout-ready stage.", {
+		await this.logRuntimeEvent("startup-sequence-started", "插件进入布局就绪阶段。", {
 			category: "lifecycle",
 		});
 
@@ -419,37 +492,47 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		this.registerFileEvents();
 
 		if (this.settings.autoOpenConnectionsView) {
-			await this.ensureViewOpen(VIEW_TYPE_CONNECTIONS);
-			await this.logRuntimeEvent("connections-view-auto-opened", "Connections view opened automatically.", {
+			// Auto-open should not steal focus from the editor.
+			await this.ensureConnectionsViewOpen({ active: false, reveal: true });
+			await this.logRuntimeEvent("connections-view-auto-opened", "关联视图已自动打开。", {
 				category: "lifecycle",
 			});
 		}
 
 		if (this.noteStore.size === 0) {
 			if (this.indexSnapshotIncompatible) {
-				new Notice("Detected an index snapshot that is incompatible with the current embedding or chunking configuration. Loading was skipped. Please rebuild the index manually.", 8000);
+				new Notice("检测到当前嵌入、切分或笔记向量策略与已有索引快照不兼容，已跳过加载。请手动重建索引。", 8000);
 			} else if (
 				this.settings.embeddingProvider === "remote" &&
 				(!this.settings.remoteBaseUrl.trim() || !this.settings.remoteApiKey.trim())
 			) {
 				new Notice(
-					"Remote embeddings are enabled, but API Base URL or API Key is missing. Complete the configuration and rebuild the index manually.",
+					"已启用远程嵌入，但 API 基础 URL 或 API 密钥缺失。请补全配置后手动重建索引。",
 					8000,
 				);
 				await this.logRuntimeEvent(
-					"startup-auto-rebuild-skipped",
-					"Skipped automatic rebuild on startup because the remote embeddings configuration is incomplete.",
+					"startup-index-rebuild-blocked",
+					"远程嵌入配置不完整，无法重建索引（需用户补全配置后手动重建）。",
 					{
 						category: "lifecycle",
 						provider: "remote",
 					},
 				);
 			} else {
-				await this.rebuildIndex();
+				new Notice("未检测到可用索引快照。如需更新索引，请手动执行“重建索引”。", 8000);
+				await this.logRuntimeEvent(
+					"startup-auto-rebuild-disabled",
+					"启动时未自动重建索引（需手动触发）。",
+					{
+						category: "lifecycle",
+					},
+				);
 			}
+		} else {
+			await this.maybeNotifyWeeklyRebuildReminder();
 		}
 
-		await this.logRuntimeEvent("plugin-ready", "Plugin startup completed.", {
+		await this.logRuntimeEvent("plugin-ready", "插件启动完成。", {
 			category: "lifecycle",
 		});
 		console.log("Semantic Connections: ready");
@@ -467,7 +550,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				if (this.isExcludedPath(file.path)) {
 					return;
 				}
-				this.reindexQueue.enqueue({ type: "create", path: file.path });
+				this.scheduleDirtyCheck(file.path);
 			}),
 		);
 
@@ -482,7 +565,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				if (this.isExcludedPath(file.path)) {
 					return;
 				}
-				this.reindexQueue.enqueue({ type: "modify", path: file.path });
+				this.scheduleDirtyCheck(file.path);
 			}),
 		);
 
@@ -514,9 +597,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				}
 
 				if (!oldIsMd && newIsMd) {
-					if (!this.isExcludedPath(newPath)) {
-						this.reindexQueue.enqueue({ type: "create", path: newPath });
-					}
+					// 新增 Markdown 文件不自动索引；由用户手动执行“同步变动笔记”。
 					return;
 				}
 
@@ -531,7 +612,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 				if (this.isExcludedPath(oldPath) && !this.isExcludedPath(newPath)) {
 					this.reindexQueue.enqueue({ type: "delete", path: oldPath });
-					this.reindexQueue.enqueue({ type: "create", path: newPath });
+					// 迁出排除目录的笔记不自动索引；由用户手动执行“同步变动笔记”。
 					return;
 				}
 
@@ -550,6 +631,57 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		);
 	}
 
+	private clearDirtyCheckTimers(): void {
+		for (const timer of this.dirtyCheckTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.dirtyCheckTimers.clear();
+	}
+
+	private scheduleDirtyCheck(path: string): void {
+		const existing = this.dirtyCheckTimers.get(path);
+		if (existing) {
+			clearTimeout(existing);
+		}
+
+		const timer = setTimeout(() => {
+			this.dirtyCheckTimers.delete(path);
+			void this.reconcileDirtyFlagForPath(path);
+		}, 400);
+		this.dirtyCheckTimers.set(path, timer);
+	}
+
+	private async reconcileDirtyFlagForPath(path: string): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(path);
+		if (!(file instanceof TFile) || file.extension !== "md") {
+			return;
+		}
+		if (this.isExcludedPath(file.path)) {
+			return;
+		}
+
+		const existing = this.noteStore.get(file.path);
+		if (!existing) {
+			return;
+		}
+
+		const content = await this.app.vault.cachedRead(file);
+		const hash = hashContent(content);
+		const isOutdated = existing.hash !== hash;
+		const isMarkedDirty = existing.dirty || existing.outdated;
+
+		if (isOutdated && !isMarkedDirty) {
+			this.noteStore.set({ ...existing, dirty: true, outdated: true });
+			this.scheduleIndexSave();
+			return;
+		}
+
+		if (!isOutdated && isMarkedDirty) {
+			this.noteStore.set({ ...existing, dirty: undefined, outdated: undefined });
+			this.scheduleIndexSave();
+		}
+	}
+
 	private async ensureViewOpen(viewType: string, options?: { reveal?: boolean }): Promise<void> {
 		const { workspace } = this.app;
 		const reveal = options?.reveal ?? false;
@@ -559,9 +691,18 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		if (leaves.length > 0) {
 			leaf = leaves[0];
 		} else {
-			leaf = workspace.getRightLeaf(false);
-			if (leaf) {
-				await leaf.setViewState({ type: viewType, active: true });
+			const ensureSideLeaf = (workspace as unknown as { ensureSideLeaf?: unknown }).ensureSideLeaf;
+			if (typeof ensureSideLeaf === "function") {
+				leaf = await (workspace as any).ensureSideLeaf(viewType, "right", {
+					active: true,
+					reveal,
+					split: false,
+				});
+			} else {
+				leaf = workspace.getRightLeaf(true);
+				if (leaf) {
+					await leaf.setViewState({ type: viewType, active: true });
+				}
 			}
 		}
 
@@ -570,8 +711,398 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		}
 	}
 
+	private async ensureConnectionsViewOpen(options?: { reveal?: boolean; active?: boolean }): Promise<void> {
+		const { workspace } = this.app;
+		const reveal = options?.reveal ?? false;
+		const active = options?.active ?? false;
+		const editorLeaf = workspace.getMostRecentLeaf(workspace.rootSplit);
+
+		// Ensure the right sidebar is visible when we want to reveal the view.
+		if (reveal) {
+			try {
+				workspace.rightSplit.expand();
+			} catch {
+				// Best-effort: Obsidian versions / mobile drawers may vary.
+			}
+		}
+
+		// Always place the Connections view into the right sidebar. This is the core "关系视图" UX.
+		const ensureSideLeaf = (workspace as unknown as { ensureSideLeaf?: unknown }).ensureSideLeaf;
+		let rightLeaf: WorkspaceLeaf | null = null;
+		if (typeof ensureSideLeaf === "function") {
+			rightLeaf = await (workspace as any).ensureSideLeaf(VIEW_TYPE_CONNECTIONS, "right", {
+				active: true,
+				reveal,
+				split: false,
+			});
+		} else {
+			rightLeaf = workspace.getRightLeaf(true);
+			if (rightLeaf) {
+				await rightLeaf.setViewState({ type: VIEW_TYPE_CONNECTIONS, active: true });
+			}
+		}
+
+		// If the leaf is deferred (Obsidian 1.7+), ensure it's loaded even when we avoid focusing it.
+		if (rightLeaf && (rightLeaf as unknown as { loadIfDeferred?: unknown }).loadIfDeferred) {
+			await (rightLeaf as any).loadIfDeferred();
+		}
+
+		if (rightLeaf && reveal) {
+			await workspace.revealLeaf(rightLeaf);
+		}
+
+		// Auto-open should not steal focus from the editor.
+		if (!active && editorLeaf) {
+			workspace.setActiveLeaf(editorLeaf, { focus: true });
+		}
+
+		// Keep a single Connections view leaf to avoid duplicates and surprise behavior.
+		const leaves = workspace.getLeavesOfType(VIEW_TYPE_CONNECTIONS);
+		for (const leaf of leaves) {
+			if (rightLeaf && leaf === rightLeaf) continue;
+			leaf.detach();
+		}
+	}
+
 	async activateView(viewType: string): Promise<void> {
+		if (viewType === VIEW_TYPE_CONNECTIONS) {
+			await this.ensureConnectionsViewOpen({ reveal: true, active: true });
+			return;
+		}
+
 		await this.ensureViewOpen(viewType, { reveal: true });
+	}
+
+	async openNoteInMainLeaf(notePath: string, range?: [number, number]): Promise<void> {
+		const file = this.app.vault.getAbstractFileByPath(notePath);
+		if (!(file instanceof TFile)) {
+			new Notice(`未找到笔记：${notePath}`, 5000);
+			return;
+		}
+
+		const leaf =
+			this.app.workspace.getMostRecentLeaf(this.app.workspace.rootSplit) ??
+			this.app.workspace.getLeaf(false);
+
+		try {
+			await leaf.openFile(file, { active: true });
+			if (range) {
+				this.highlightLineRangeInLeaf(leaf, range);
+			}
+		} catch (error) {
+			console.error("Semantic Connections: failed to open note", notePath, error);
+			await this.logRuntimeError("open-note", error, {
+				stage: "open-note",
+				errorType: "runtime",
+				filePath: notePath,
+			});
+			new Notice("打开笔记失败，请检查控制台或日志。", 6000);
+		}
+	}
+
+	private highlightLineRangeInLeaf(leaf: WorkspaceLeaf, range: [number, number]): void {
+		const view = leaf.view;
+		if (!(view instanceof MarkdownView)) {
+			return;
+		}
+
+		const startValue = range[0];
+		const endValue = range[1];
+		if (!Number.isFinite(startValue) || !Number.isFinite(endValue)) {
+			return;
+		}
+
+		const editor = view.editor;
+		const lastLine = editor.lastLine();
+		if (!Number.isInteger(lastLine) || lastLine < 0) {
+			return;
+		}
+
+		const rawStartLine = Math.max(0, Math.floor(startValue));
+		const rawEndLine = Math.max(rawStartLine, Math.floor(endValue));
+		const startLine = Math.min(rawStartLine, lastLine);
+		const endLine = Math.min(rawEndLine, lastLine);
+
+		const toCh = editor.getLine(endLine).length;
+		const from = { line: startLine, ch: 0 };
+		const to = { line: endLine, ch: toCh };
+
+		editor.setSelection(from, to);
+		editor.scrollIntoView({ from, to }, true);
+		editor.focus();
+	}
+
+	async retryFailedIndexTasks(): Promise<void> {
+		if (this.isRebuilding) {
+			new Notice("正在重建索引，请稍后重试失败项。", 6000);
+			return;
+		}
+		if (this.isSyncing) {
+			new Notice("正在同步笔记，请稍后重试失败项。", 6000);
+			return;
+		}
+
+		const paths = this.failedTaskManager.getAllPaths();
+		if (paths.length === 0) {
+			new Notice("没有需要重试的失败项。", 5000);
+			return;
+		}
+
+		const isExcluded = (filePath: string): boolean => {
+			return this.settings.excludedFolders.some((folder) => {
+				return filePath.startsWith(folder + "/") || filePath === folder;
+			});
+		};
+
+		let removed = 0;
+		let queued = 0;
+
+		for (const path of paths) {
+			if (isExcluded(path)) {
+				if (this.failedTaskManager.resolve(path)) {
+					removed++;
+				}
+				continue;
+			}
+
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile) || file.extension !== "md") {
+				if (this.failedTaskManager.resolve(path)) {
+					removed++;
+				}
+				continue;
+			}
+
+			this.reindexQueue.enqueue({ type: "modify", path: file.path });
+			queued++;
+		}
+
+		if (removed > 0) {
+			await this.failedTaskManager.save();
+		}
+
+		if (queued === 0) {
+			new Notice("失败项已清理（文件不存在或已被排除）。", 6000);
+			return;
+		}
+
+		new Notice(`已加入队列：${queued} 个失败项${removed > 0 ? `（已清理 ${removed} 项）` : ""}。`, 7000);
+
+		if (!this.reindexQueue.isProcessing) {
+			await this.reindexQueue.flushNow();
+		}
+	}
+
+	async syncChangedNotes(): Promise<void> {
+		if (this.isRebuilding) {
+			new Notice("正在重建索引，请稍后再同步。", 6000);
+			return;
+		}
+		if (this.isSyncing) {
+			new Notice("正在同步笔记，请稍后再试。", 6000);
+			return;
+		}
+
+		const notice = new Notice("正在扫描 Vault 变动笔记...", 0);
+		try {
+			const { paths, tokenEstimate } = await this.scanVaultForChangedNotes();
+			notice.hide();
+
+			if (paths.length === 0) {
+				new Notice("未发现需要同步的笔记。", 5000);
+				return;
+			}
+
+			new SyncChangedNotesModal(this.app, {
+				changedCount: paths.length,
+				tokenEstimate,
+				onConfirm: async () => {
+					await this.syncNotes(paths, { noticeTitle: "正在同步变动笔记..." });
+				},
+			}).open();
+		} catch (error) {
+			const diagnostic = normalizeErrorDiagnostic(error);
+			notice.setMessage(`扫描失败：${diagnostic.message}`);
+			setTimeout(() => notice.hide(), 5000);
+			await this.logRuntimeError("sync-changed-notes-scan", error, {
+				stage: diagnostic.stage ?? "sync-changed-notes-scan",
+			});
+		}
+	}
+
+	async syncNotes(
+		paths: string[],
+		options?: {
+			noticeTitle?: string;
+		},
+	): Promise<{ total: number; failed: number }> {
+		const unique = Array.from(new Set(paths.filter((path) => path.trim().length > 0)));
+		if (unique.length === 0) {
+			return { total: 0, failed: 0 };
+		}
+
+		if (this.isRebuilding) {
+			new Notice("正在重建索引，请稍后再同步。", 6000);
+			return { total: 0, failed: 0 };
+		}
+		if (this.isSyncing) {
+			new Notice("正在同步笔记，请稍后再试。", 6000);
+			return { total: 0, failed: 0 };
+		}
+
+		const files: TFile[] = [];
+		for (const path of unique) {
+			const file = this.app.vault.getAbstractFileByPath(path);
+			if (!(file instanceof TFile) || file.extension !== "md") {
+				continue;
+			}
+			if (this.isExcludedPath(file.path)) {
+				continue;
+			}
+			files.push(file);
+		}
+
+		if (files.length === 0) {
+			new Notice("未找到可同步的 Markdown 笔记（可能已被排除或已删除）。", 6000);
+			return { total: 0, failed: 0 };
+		}
+
+		this.isSyncing = true;
+		const notice = options?.noticeTitle ? new Notice(options.noticeTitle, 0) : null;
+		let failed = 0;
+
+		try {
+			for (let i = 0; i < files.length; i++) {
+				const file = files[i];
+				notice?.setMessage(`${options?.noticeTitle ?? "正在同步..."}（${i + 1}/${files.length}）`);
+
+				const taskType = this.noteStore.has(file.path) ? "modify" : "create";
+				try {
+					await this.reindexService.processTask({ type: taskType, path: file.path });
+					this.scheduleIndexSave();
+				} catch (error) {
+					failed++;
+					console.error("Semantic Connections: manual sync failed", error);
+					await this.logRuntimeError("sync-note", error, {
+						stage: "manual-sync",
+						filePath: file.path,
+					});
+				}
+			}
+
+			await this.flushIndexSave();
+			this.bumpIndexVersion("sync-notes-finished");
+		} finally {
+			this.isSyncing = false;
+		}
+
+		const message =
+			failed > 0
+				? `同步完成：成功 ${files.length - failed}/${files.length}，失败 ${failed}。`
+				: `同步完成：已同步 ${files.length} 篇笔记。`;
+
+		if (notice) {
+			notice.setMessage(message);
+			setTimeout(() => notice.hide(), failed > 0 ? 6000 : 3000);
+		} else {
+			new Notice(message, failed > 0 ? 6000 : 3000);
+		}
+
+		return { total: files.length, failed };
+	}
+
+	private async scanVaultForChangedNotes(): Promise<{ paths: string[]; tokenEstimate: number }> {
+		const files = this.scanner.getMarkdownFiles(this.settings.excludedFolders);
+		const paths: string[] = [];
+		let tokenEstimate = 0;
+		let noteStoreDirty = false;
+
+		for (const file of files) {
+			const content = await this.scanner.readContent(file);
+			const hash = hashContent(content);
+
+			const existing = this.noteStore.get(file.path);
+			const isNew = !existing;
+			const isModified = existing ? existing.hash !== hash : false;
+			let isMarkedDirty = existing ? Boolean(existing.dirty || existing.outdated) : false;
+
+			if (existing) {
+				if (isModified && !isMarkedDirty) {
+					this.noteStore.set({ ...existing, dirty: true, outdated: true });
+					isMarkedDirty = true;
+					noteStoreDirty = true;
+				} else if (!isModified && isMarkedDirty) {
+					this.noteStore.set({ ...existing, dirty: undefined, outdated: undefined });
+					isMarkedDirty = false;
+					noteStoreDirty = true;
+				}
+			}
+
+			if (isNew || isModified || isMarkedDirty) {
+				paths.push(file.path);
+				tokenEstimate += this.estimateEmbeddingTokensForContent(file.path, content);
+			}
+		}
+
+		if (noteStoreDirty) {
+			this.scheduleIndexSave();
+		}
+
+		return { paths, tokenEstimate };
+	}
+
+	private estimateEmbeddingTokensForContent(notePath: string, content: string): number {
+		const chunks = this.chunker.chunk(notePath, content);
+		if (chunks.length === 0) {
+			const withoutFm = content.replace(/^---[\s\S]*?---\n*/, "");
+			const summary = withoutFm.slice(0, 500).trim();
+			return summary ? this.estimateTokensForText(summary) : 0;
+		}
+
+		let total = 0;
+		for (const chunk of chunks) {
+			const heading = this.getHeadingContextForEstimation(chunk.heading);
+			const payload = heading ? `${heading}\n\n${chunk.text}` : chunk.text;
+			total += this.estimateTokensForText(payload);
+		}
+		return total;
+	}
+
+	private getHeadingContextForEstimation(heading: string): string {
+		const trimmed = heading.trim();
+		if (!trimmed) {
+			return "";
+		}
+		if (trimmed.length <= 200) {
+			return trimmed;
+		}
+		return `${trimmed.slice(0, 200).trimEnd()}...`;
+	}
+
+	private estimateTokensForText(text: string): number {
+		if (!text) {
+			return 0;
+		}
+
+		let cjk = 0;
+		let other = 0;
+
+		for (const char of text) {
+			const code = char.charCodeAt(0);
+			const isCjk =
+				(code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+				(code >= 0x3400 && code <= 0x4dbf) || // CJK Unified Ideographs Extension A
+				(code >= 0x3040 && code <= 0x30ff) || // Hiragana/Katakana
+				(code >= 0xac00 && code <= 0xd7af); // Hangul Syllables
+
+			if (isCjk) {
+				cjk++;
+			} else {
+				other++;
+			}
+		}
+
+		return Math.ceil(cjk + other / 4);
 	}
 
 	async rebuildIndex(options?: RebuildIndexOptions): Promise<void> {
@@ -584,16 +1115,16 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		const emitProgress = (progress: RebuildIndexProgress): void => {
 			options?.onProgress?.(progress);
 		};
-		const notice = new Notice("Rebuilding semantic index...", 0);
+		const notice = new Notice("正在重建语义索引...", 0);
 
 		try {
 			emitProgress({
 				stage: "preparing",
-				message: "Preparing to rebuild the index...",
+				message: "正在准备重建索引...",
 				percent: 0,
 			});
 
-			await this.logRuntimeEvent("rebuild-index-started", "Started a full index rebuild.", {
+			await this.logRuntimeEvent("rebuild-index-started", "开始完整重建索引。", {
 				category: "indexing",
 			});
 			await this.errorLogger.clear();
@@ -606,8 +1137,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					const percent = totalNotes > 0 ? Math.round((done / totalNotes) * 100) : 100;
 					const message =
 						totalNotes > 0
-							? `Building semantic index... (${done}/${totalNotes})`
-							: "No notes were found for indexing.";
+							? `正在构建语义索引...（${done}/${totalNotes}）`
+							: "没有找到可索引的笔记。";
 					emitProgress({
 						stage: "indexing",
 						message,
@@ -621,16 +1152,24 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 			emitProgress({
 				stage: "saving",
-				message: "Saving index to disk...",
+				message: "正在将索引保存到磁盘...",
 				percent: 100,
 			});
-			notice.setMessage("Saving index to disk...");
+			notice.setMessage("正在将索引保存到磁盘...");
+			this.settings.lastFullRebuildAt = Date.now();
 			await this.saveIndexSnapshot();
+			try {
+				await this.saveSettings("rebuild-index-metadata");
+			} catch {
+				// Non-fatal: indexing succeeded even if settings persistence fails.
+			}
+
+			this.bumpIndexVersion("rebuild-index-finished");
 
 			const message =
 				failed > 0
-					? `Index rebuild finished: ${this.noteStore.size} notes indexed, ${failed} failed.`
-					: `Index rebuild finished: ${this.noteStore.size} notes indexed.`;
+					? `索引重建完成：已索引 ${this.noteStore.size} 篇笔记，失败 ${failed} 篇。`
+					: `索引重建完成：已索引 ${this.noteStore.size} 篇笔记。`;
 			emitProgress({
 				stage: "success",
 				message,
@@ -642,8 +1181,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			await this.logRuntimeEvent(
 				"rebuild-index-finished",
 				failed > 0
-					? "Full index rebuild completed with failures."
-					: "Full index rebuild completed successfully.",
+					? "完整重建索引已完成，但存在失败项。"
+					: "完整重建索引已成功完成。",
 				{
 					category: "indexing",
 					details: [
@@ -656,7 +1195,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			setTimeout(() => notice.hide(), failed > 0 ? 5000 : 3000);
 		} catch (error) {
 			const diagnostic = normalizeErrorDiagnostic(error);
-			const message = `Index rebuild failed: ${diagnostic.message}`;
+			const message = `索引重建失败：${diagnostic.message}`;
 			emitProgress({
 				stage: "error",
 				message,
@@ -751,28 +1290,34 @@ export default class SemanticConnectionsPlugin extends Plugin {
 	async showIndexStorageSummary(): Promise<void> {
 		try {
 			const summary = await this.getIndexStorageSummary();
+			const snapshotFormatLabel =
+				summary.snapshotFormat === "json+binary"
+					? "JSON + 二进制"
+					: summary.snapshotFormat === "json-only"
+						? "仅 JSON"
+						: "缺失";
 			const lines = [
-				`Index summary: ${summary.noteCount} notes, ${summary.chunkCount} semantic chunks, ${summary.vectorCount} vectors`,
-				`Vector breakdown: note=${summary.noteVectorCount}, chunk=${summary.chunkVectorCount}, dimension=${summary.embeddingDimension}`,
-				`Snapshot format: ${summary.snapshotFormat}`,
+				`索引概况：${summary.noteCount} 篇笔记，${summary.chunkCount} 个语义分块，${summary.vectorCount} 个向量`,
+				`向量明细：笔记=${summary.noteVectorCount}，分块=${summary.chunkVectorCount}，维度=${summary.embeddingDimension}`,
+				`快照格式：${snapshotFormatLabel}`,
 			];
 
 			if (summary.parts.length > 0) {
 				lines.push(
-					`Total size: ${this.formatByteSize(summary.totalBytes)}`,
+					`总大小：${this.formatByteSize(summary.totalBytes)}`,
 					...summary.parts.flatMap((part) => [
 						`${part.label}: ${this.formatByteSize(part.bytes)} (${(part.share * 100).toFixed(1)}%)`,
-						`Path: ${part.path}`,
+						`路径：${part.path}`,
 					]),
 				);
 			} else {
-				lines.push("No persisted index snapshot files were found.");
+				lines.push("未找到已持久化的索引快照文件。");
 			}
 
 			new Notice(lines.join("\n"), 12000);
 			console.info("Semantic Connections index storage summary\n" + lines.join("\n"));
 		} catch (error) {
-			new Notice("Failed to read index storage statistics. Check the error log.", 6000);
+			new Notice("读取索引存储统计失败，请检查错误日志。", 6000);
 			await this.logRuntimeError("show-index-storage-summary", error, {
 				stage: "index-storage-summary",
 				errorType: "storage",
@@ -835,15 +1380,30 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			const chunkingStrategyMismatch =
 				snapshot.chunkingStrategy !== CURRENT_CHUNKING_STRATEGY;
 
+			const noteVectorStrategyMismatch =
+				snapshot.noteVectorStrategy !== CURRENT_NOTE_VECTOR_STRATEGY;
+
 			if (
 				providerMismatch ||
 				remoteConfigMismatch ||
 				dimensionMismatch ||
-				chunkingStrategyMismatch
+				chunkingStrategyMismatch ||
+				noteVectorStrategyMismatch
 			) {
 				this.indexSnapshotIncompatible = true;
-				new Notice("Detected an index snapshot that is incompatible with the current embedding or chunking configuration. Loading was skipped. Please rebuild the index manually.", 8000);
+				new Notice("检测到当前嵌入、切分或笔记向量策略与已有索引快照不兼容，已跳过加载。请手动重建索引。", 8000);
 				return;
+			}
+
+			if (typeof snapshot.lastFullRebuildAt === "number" && snapshot.lastFullRebuildAt > 0) {
+				this.settings.lastFullRebuildAt = snapshot.lastFullRebuildAt;
+			} else if (
+				this.settings.lastFullRebuildAt <= 0 &&
+				typeof snapshot.savedAt === "number" &&
+				snapshot.savedAt > 0
+			) {
+				// Backward compatible fallback for older snapshots that did not persist lastFullRebuildAt.
+				this.settings.lastFullRebuildAt = snapshot.savedAt;
 			}
 
 			this.noteStore.load(snapshot.noteStore);
@@ -862,7 +1422,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				this.vectorStore.load(snapshot.vectorStore);
 			}
 
-			await this.logRuntimeEvent("index-snapshot-loaded", "Restored the index snapshot from disk.", {
+			this.bumpIndexVersion("index-snapshot-loaded");
+
+			await this.logRuntimeEvent("index-snapshot-loaded", "已从磁盘恢复索引快照。", {
 				category: "storage",
 				details: [
 					`notes=${this.noteStore.size}`,
@@ -921,6 +1483,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			const snapshot: PersistedIndexSnapshot = {
 				version: CURRENT_INDEX_SNAPSHOT_VERSION,
 				savedAt: Date.now(),
+				lastFullRebuildAt:
+					this.settings.lastFullRebuildAt > 0 ? this.settings.lastFullRebuildAt : undefined,
 				embeddingProvider: this.settings.embeddingProvider,
 				embeddingDimension: this.embeddingService.dimension,
 				remoteBaseUrl:
@@ -932,6 +1496,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 						? this.settings.remoteModel.trim()
 						: undefined,
 				chunkingStrategy: CURRENT_CHUNKING_STRATEGY,
+				noteVectorStrategy: CURRENT_NOTE_VECTOR_STRATEGY,
 				vectorBinaryPath: this.indexVectorSnapshotPath,
 				noteStore: this.noteStore.serialize(),
 				chunkStore: this.chunkStore.serialize(),
@@ -950,6 +1515,41 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			});
 			console.error("Semantic Connections: failed to save index snapshot", error);
 		}
+	}
+
+	private async maybeNotifyWeeklyRebuildReminder(): Promise<void> {
+		const lastFullRebuildAt = this.settings.lastFullRebuildAt;
+		if (!Number.isFinite(lastFullRebuildAt) || lastFullRebuildAt <= 0) {
+			return;
+		}
+
+		const now = Date.now();
+		const delta = now - lastFullRebuildAt;
+		if (!Number.isFinite(delta) || delta < 0) {
+			return;
+		}
+
+		const daysSince = Math.floor(delta / MS_PER_DAY);
+		if (daysSince < FULL_REBUILD_REMINDER_DAYS) {
+			return;
+		}
+
+		const lastText = new Date(lastFullRebuildAt).toLocaleString();
+		new Notice(
+			`索引已 ${daysSince} 天未全量重建（上次：${lastText}）。如需更新，请手动执行“重建索引”。`,
+			9000,
+		);
+		await this.logRuntimeEvent(
+			"startup-weekly-rebuild-reminder",
+			"检测到索引超过设定周期未全量重建，已提示用户手动重建。",
+			{
+				category: "lifecycle",
+				details: [
+					`days_since_last_full_rebuild=${daysSince}`,
+					`last_full_rebuild_at=${lastFullRebuildAt}`,
+				],
+			},
+		);
 	}
 
 	private scheduleIndexSave(): void {

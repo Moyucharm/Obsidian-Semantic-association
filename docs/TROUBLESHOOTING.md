@@ -1,15 +1,19 @@
 # Troubleshooting Notes
 
-## #001 Remote embeddings are not fully configured
+## #001 The plugin does not rebuild automatically on startup
 
 Symptoms:
 
-- the plugin does not rebuild automatically on startup
+- the plugin shows a reminder to rebuild (or you see an empty index) but does not rebuild automatically
 - manual rebuild reports incomplete remote configuration
 
 Cause:
 
-The remote provider requires all of the following:
+This is expected behavior.
+
+Full rebuilds are user-triggered to avoid surprise remote API usage.
+
+In addition, the remote provider requires all of the following before a rebuild can work:
 
 - `API Base URL`
 - `API Key`
@@ -17,11 +21,15 @@ The remote provider requires all of the following:
 
 Fix:
 
-1. Fill in `API Base URL`
-2. Fill in `API Key`
-3. Confirm `Remote Model`
-4. Click `Test Connection`
-5. Run `Rebuild Index`
+1. Fill in `API Base URL` (`API 基础 URL`)
+2. Fill in `API Key` (`API 密钥`)
+3. Confirm `Remote Model` (`远程模型`)
+4. Click `Test Connection` (`测试连接`)
+5. Run `Rebuild Index` (`重建索引`) when you want to refresh the index
+
+Optional:
+
+- Enable incremental indexing in Settings if you want background updates between full rebuilds.
 
 ## #002 Test Connection succeeds but rebuild fails
 
@@ -104,6 +112,7 @@ This usually happens when one of the compatibility keys changed, especially:
 - remote base URL
 - embedding dimension
 - chunking strategy
+- note vector strategy
 
 In that case, run `Rebuild Index`.
 
@@ -117,7 +126,31 @@ The current formula is:
 finalScore = noteScore * 0.7 + passageScore * 0.3
 ```
 
-This means a note can move up or down depending on how well its best passage aligns with the current note.
+This means a note can move up or down depending on passage matching, which is aggregated over the
+matched passages after thresholding and truncation.
+
+## #010 Why do I see fewer connections or no passages?
+
+Symptoms:
+
+- fewer notes show up than expected
+- a note shows up, but no passages are shown
+
+Cause:
+
+Connections are computed in two stages:
+
+1. note-level recall returns candidates
+2. chunk-level passage matching applies a similarity threshold
+
+If `minPassageScore` is too high, candidates can be dropped because none of their passages
+pass the threshold.
+
+Fix:
+
+1. Lower the passage similarity threshold (`minPassageScore`)
+2. Increase `maxPassagesPerNote` (or set it to `0` to disable truncation)
+3. Rebuild the index if you suspect stale or missing chunk vectors
 
 ## #008 Will local config or logs be committed?
 
@@ -141,3 +174,18 @@ Files to deploy into the Obsidian plugin directory:
 - `main.js` or `dist/main.js`
 - `manifest.json` or `dist/manifest.json`
 - `styles.css` or `dist/styles.css`
+
+Note:
+
+- Production builds clean `dist/` before copying files, so `dist/` should only contain these three outputs.
+
+## #011 Where are logs stored?
+
+The plugin writes logs to JSON files in the plugin data directory:
+
+- `error-log.json`
+- `runtime-log.json`
+
+The exact path depends on your vault config directory, but it is typically under:
+
+- `.obsidian/plugins/semantic-connections/`
