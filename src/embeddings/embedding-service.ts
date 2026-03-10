@@ -1,6 +1,5 @@
 import type { ErrorDiagnostic, SemanticConnectionsSettings, Vector } from "../types";
 import { normalizeErrorDiagnostic } from "../utils/error-utils";
-import { MockProvider } from "./mock-provider";
 import type { EmbeddingProvider } from "./provider";
 import { RemoteProvider } from "./remote-provider";
 
@@ -81,12 +80,6 @@ export class EmbeddingService {
 	}
 
 	private createProvider(settings: SemanticConnectionsSettings): EmbeddingProvider {
-		switch (settings.embeddingProvider) {
-			case "remote":
-				return this.createRemoteProvider(settings);
-			case "mock":
-			default:
-				return new MockProvider();
-		}
+		return this.createRemoteProvider(settings);
 	}
 }

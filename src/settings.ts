@@ -24,88 +24,12 @@ export class SettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl("h2", { text: "语义关联设置" });
+		containerEl.createEl("h2", { text: "Semantic Connections Settings" });
+		this.renderRemoteSettings(containerEl);
 
 		new Setting(containerEl)
-			.setName("最大关联数")
-			.setDesc("侧栏中显示的最大相关笔记数量。")
-			.addSlider((slider) =>
-				slider
-					.setLimits(5, 50, 5)
-					.setValue(this.plugin.settings.maxConnections)
-					.setDynamicTooltip()
-					.onChange(async (value) => {
-						const previousValue = this.plugin.settings.maxConnections;
-						this.plugin.settings.maxConnections = value;
-						await this.saveSettingsOrRollback("max-connections", () => {
-							this.plugin.settings.maxConnections = previousValue;
-						});
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("自动索引")
-			.setDesc("Markdown 文件变化时自动更新索引。")
-			.addToggle((toggle) =>
-				toggle.setValue(this.plugin.settings.autoIndex).onChange(async (value) => {
-					const previousValue = this.plugin.settings.autoIndex;
-					this.plugin.settings.autoIndex = value;
-					await this.saveSettingsOrRollback("auto-index", () => {
-						this.plugin.settings.autoIndex = previousValue;
-					});
-				}),
-			);
-
-		new Setting(containerEl)
-			.setName("启动时自动打开关联视图")
-			.setDesc("插件启动时自动打开右侧关联视图。")
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.autoOpenConnectionsView)
-					.onChange(async (value) => {
-						const previousValue = this.plugin.settings.autoOpenConnectionsView;
-						this.plugin.settings.autoOpenConnectionsView = value;
-						await this.saveSettingsOrRollback("auto-open-connections-view", () => {
-							this.plugin.settings.autoOpenConnectionsView = previousValue;
-						});
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName("向量提供方式")
-			.setDesc("选择生成 embeddings 的方式。")
-			.addDropdown((dropdown) =>
-				dropdown
-					.addOption("remote", "远程 API")
-					.addOption("mock", "Mock")
-					.setValue(this.plugin.settings.embeddingProvider)
-					.onChange(async (value) => {
-						const previousValue = this.plugin.settings.embeddingProvider;
-						const nextValue = value as "remote" | "mock";
-						this.plugin.settings.embeddingProvider = nextValue;
-						const saved = await this.saveSettingsOrRollback("embedding-provider", () => {
-							this.plugin.settings.embeddingProvider = previousValue;
-						});
-						if (!saved) {
-							return;
-						}
-
-						this.plugin.embeddingService.switchProvider(this.plugin.settings);
-						if (previousValue !== nextValue) {
-							this.invalidateIndex("向量提供方式已变更，旧索引已清空，请重新执行“重建索引”。");
-						}
-
-						this.display();
-					}),
-			);
-
-		if (this.plugin.settings.embeddingProvider === "remote") {
-			this.renderRemoteSettings(containerEl);
-		}
-
-		new Setting(containerEl)
-			.setName("排除文件夹")
-			.setDesc("索引时需要跳过的文件夹，每行一个路径。")
+			.setName("Excluded folders")
+			.setDesc("One folder path per line. These folders are skipped during indexing.")
 			.addTextArea((text) =>
 				text
 					.setPlaceholder("templates\narchive")
@@ -120,7 +44,10 @@ export class SettingTab extends PluginSettingTab {
 							this.plugin.settings.excludedFolders = previousValue;
 						});
 						if (saved) {
-							new Notice("排除文件夹已更新。如需应用到现有索引，请重新执行“重建索引”。", 6000);
+							new Notice(
+								"Excluded folders updated. Rebuild the index to apply them to existing data.",
+								6000,
+							);
 						}
 					}),
 			);
@@ -130,11 +57,11 @@ export class SettingTab extends PluginSettingTab {
 	}
 
 	private renderRemoteSettings(containerEl: HTMLElement): void {
-		containerEl.createEl("h3", { text: "远程 Embeddings" });
+		containerEl.createEl("h3", { text: "Remote embeddings" });
 
 		new Setting(containerEl)
 			.setName("API Base URL")
-			.setDesc("插件会请求 {baseUrl}/v1/embeddings。")
+			.setDesc("Requests are sent to {baseUrl}/v1/embeddings.")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteBaseUrl;
@@ -155,13 +82,15 @@ export class SettingTab extends PluginSettingTab {
 					text.setValue(this.plugin.settings.remoteBaseUrl);
 					this.plugin.embeddingService.switchProvider(this.plugin.settings);
 					if (previousValue !== nextValue) {
-						this.invalidateIndex("远程 API Base URL 已变更，旧索引已清空，请重新执行“重建索引”。");
+						this.invalidateIndex(
+							"Remote API Base URL changed. The existing index was cleared. Please rebuild the index.",
+						);
 					}
 				};
 
-				text.setPlaceholder("https://your-api.example.com").setValue(
-					this.plugin.settings.remoteBaseUrl,
-				);
+				text
+					.setPlaceholder("https://your-api.example.com")
+					.setValue(this.plugin.settings.remoteBaseUrl);
 				text.inputEl.addEventListener("change", () => {
 					void commit();
 				});
@@ -169,7 +98,7 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("API Key")
-			.setDesc("请求远程 embeddings API 的 Bearer Token。")
+			.setDesc("Bearer token used for the remote embeddings API.")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteApiKey;
@@ -202,7 +131,7 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Remote Model")
-			.setDesc("默认使用 BAAI/bge-m3，仅接入 dense embedding，实际维度以接口返回为准。")
+			.setDesc("Dense embedding model name. Defaults to BAAI/bge-m3.")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteModel;
@@ -223,13 +152,15 @@ export class SettingTab extends PluginSettingTab {
 					text.setValue(this.plugin.settings.remoteModel);
 					this.plugin.embeddingService.switchProvider(this.plugin.settings);
 					if (previousValue !== nextValue) {
-						this.invalidateIndex("远程模型已变更，旧索引已清空，请重新执行“重建索引”。");
+						this.invalidateIndex(
+							"Remote model changed. The existing index was cleared. Please rebuild the index.",
+						);
 					}
 				};
 
-				text.setPlaceholder(DEFAULT_SETTINGS.remoteModel).setValue(
-					this.plugin.settings.remoteModel,
-				);
+				text
+					.setPlaceholder(DEFAULT_SETTINGS.remoteModel)
+					.setValue(this.plugin.settings.remoteModel);
 				text.inputEl.addEventListener("change", () => {
 					void commit();
 				});
@@ -237,7 +168,7 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Timeout")
-			.setDesc("远程 embeddings 请求超时时间，单位毫秒。")
+			.setDesc("Remote request timeout in milliseconds.")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteTimeoutMs;
@@ -275,7 +206,7 @@ export class SettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Batch Size")
-			.setDesc("批量 embedding 时每次请求携带的文本条数。")
+			.setDesc("Maximum number of texts sent in one embeddings request.")
 			.addText((text) => {
 				const commit = async (): Promise<void> => {
 					const previousValue = this.plugin.settings.remoteBatchSize;
@@ -313,7 +244,7 @@ export class SettingTab extends PluginSettingTab {
 
 		const testSetting = new Setting(containerEl)
 			.setName("Test Connection")
-			.setDesc("真正发送一次 embeddings 请求，验证 Base URL、API Key 和 Model 是否可用。")
+			.setDesc("Send a real embeddings request to verify the current remote configuration.")
 			.addButton((btn) => {
 				btn.setButtonText("Test Connection").setCta().onClick(async () => {
 					btn.setButtonText("Testing...");
@@ -322,7 +253,7 @@ export class SettingTab extends PluginSettingTab {
 					try {
 						await this.plugin.logRuntimeEvent(
 							"remote-embedding-test-requested",
-							"开始测试远程 embeddings 接口。",
+							"Started a remote embeddings connectivity test.",
 							{
 								category: "embedding",
 								provider: "remote",
@@ -345,10 +276,10 @@ export class SettingTab extends PluginSettingTab {
 
 						if (result.ok) {
 							resultEl.addClass("is-success");
-							resultEl.setText(`远程 embeddings 测试成功，维度 ${result.dimension}。`);
+							resultEl.setText(`Remote embeddings test succeeded. Dimension: ${result.dimension}.`);
 							await this.plugin.logRuntimeEvent(
 								"remote-embedding-test-ok",
-								"远程 embeddings 接口测试成功。",
+								"Remote embeddings test succeeded.",
 								{
 									category: "embedding",
 									provider: "remote",
@@ -361,10 +292,10 @@ export class SettingTab extends PluginSettingTab {
 							);
 						} else {
 							resultEl.addClass("is-error");
-							resultEl.setText(`远程 embeddings 测试失败：${result.error}`);
+							resultEl.setText(`Remote embeddings test failed: ${result.error}`);
 							await this.plugin.logRuntimeEvent(
 								"remote-embedding-test-failed",
-								`远程 embeddings 接口测试失败：${result.error}`,
+								`Remote embeddings test failed: ${result.error}`,
 								{
 									level: "warn",
 									category: "embedding",
@@ -392,7 +323,7 @@ export class SettingTab extends PluginSettingTab {
 						});
 						const message = error instanceof Error ? error.message : String(error);
 						resultEl.addClass("is-error");
-						resultEl.setText(`远程 embeddings 测试失败：${message}`);
+						resultEl.setText(`Remote embeddings test failed: ${message}`);
 						await this.plugin
 							.logRuntimeError("remote-embedding-test", error, {
 								errorType: "runtime",
@@ -409,23 +340,23 @@ export class SettingTab extends PluginSettingTab {
 	}
 
 	private renderIndexManagement(containerEl: HTMLElement): void {
-		containerEl.createEl("h2", { text: "索引管理" });
+		containerEl.createEl("h2", { text: "Index Management" });
 
 		const rebuildSetting = new Setting(containerEl)
-			.setName("重建索引")
+			.setName("Rebuild Index")
 			.setDesc("")
 			.addButton((btn) => {
 				const resetButton = (): void => {
-					btn.setButtonText(this.plugin.isRebuilding ? "重建中..." : "重建");
+					btn.setButtonText(this.plugin.isRebuilding ? "Rebuilding..." : "Rebuild");
 					btn.setDisabled(this.plugin.isRebuilding);
 				};
 
 				btn.setCta().onClick(async () => {
-					btn.setButtonText("重建中...");
+					btn.setButtonText("Rebuilding...");
 					btn.setDisabled(true);
 					updateRebuildProgress({
 						stage: "preparing",
-						message: "正在准备重建索引...",
+						message: "Preparing to rebuild the index...",
 						percent: 0,
 					});
 
@@ -441,7 +372,7 @@ export class SettingTab extends PluginSettingTab {
 			});
 
 		rebuildSetting.addButton((btn) => {
-			btn.setButtonText("存储统计").onClick(async () => {
+			btn.setButtonText("Storage Stats").onClick(async () => {
 				btn.setDisabled(true);
 				try {
 					await this.plugin.showIndexStorageSummary();
@@ -483,13 +414,13 @@ export class SettingTab extends PluginSettingTab {
 			const chunkCount = this.plugin.chunkStore.size;
 			rebuildSummaryEl.setText(
 				noteCount > 0
-					? `当前索引：${noteCount} 篇笔记，${chunkCount} 个语义块`
-					: "暂无索引数据",
+					? `Indexed ${noteCount} notes and ${chunkCount} chunks.`
+					: "No index data available.",
 			);
 
 			const errorCount = this.plugin.errorLogger.size;
 			if (errorCount > 0) {
-				rebuildErrorHintEl.setText(`错误日志条目：${errorCount}`);
+				rebuildErrorHintEl.setText(`Error log entries: ${errorCount}`);
 				rebuildErrorHintEl.style.display = "";
 				return;
 			}
@@ -519,14 +450,14 @@ export class SettingTab extends PluginSettingTab {
 				details.push(progress.file);
 			}
 			if (typeof progress.indexedNotes === "number") {
-				details.push(`已索引 ${progress.indexedNotes} 篇笔记`);
+				details.push(`indexed=${progress.indexedNotes}`);
 			}
 			if (typeof progress.failed === "number" && progress.failed > 0) {
-				details.push(`失败 ${progress.failed} 篇`);
+				details.push(`failed=${progress.failed}`);
 			}
 
 			if (details.length > 0) {
-				rebuildDetailEl.setText(details.join(" · "));
+				rebuildDetailEl.setText(details.join(" | "));
 				rebuildDetailEl.style.display = "";
 			} else {
 				rebuildDetailEl.empty();
@@ -540,24 +471,24 @@ export class SettingTab extends PluginSettingTab {
 	}
 
 	private renderLogSection(containerEl: HTMLElement): void {
-		containerEl.createEl("h2", { text: "日志" });
+		containerEl.createEl("h2", { text: "Logs" });
 
 		const runtimeSetting = new Setting(containerEl)
-			.setName("运行日志")
-			.setDesc("显示最近 30 条运行日志。")
+			.setName("Runtime log")
+			.setDesc("Show the most recent 30 runtime log entries.")
 			.addButton((btn) => {
-				btn.setButtonText("刷新").onClick(() => {
+				btn.setButtonText("Refresh").onClick(() => {
 					renderRuntimeLog();
 				});
 			})
 			.addButton((btn) => {
-				btn.setButtonText("清空").onClick(async () => {
+				btn.setButtonText("Clear").onClick(async () => {
 					btn.setDisabled(true);
 					try {
 						await this.plugin.clearRuntimeLogs();
 						renderRuntimeLog();
 					} catch {
-						new Notice("清空运行日志失败，请查看错误日志。", 6000);
+						new Notice("Failed to clear runtime logs. Check the error log.", 6000);
 					} finally {
 						btn.setDisabled(false);
 					}
@@ -569,21 +500,21 @@ export class SettingTab extends PluginSettingTab {
 		});
 
 		const errorSetting = new Setting(containerEl)
-			.setName("错误日志")
-			.setDesc("显示最近 20 条错误日志。")
+			.setName("Error log")
+			.setDesc("Show the most recent 20 error log entries.")
 			.addButton((btn) => {
-				btn.setButtonText("刷新").onClick(() => {
+				btn.setButtonText("Refresh").onClick(() => {
 					renderErrorLog();
 				});
 			})
 			.addButton((btn) => {
-				btn.setButtonText("清空").onClick(async () => {
+				btn.setButtonText("Clear").onClick(async () => {
 					btn.setDisabled(true);
 					try {
 						await this.plugin.clearErrorLogs();
 						renderErrorLog();
 					} catch {
-						new Notice("清空错误日志失败，请查看运行日志。", 6000);
+						new Notice("Failed to clear error logs. Check the runtime log.", 6000);
 					} finally {
 						btn.setDisabled(false);
 					}
@@ -628,7 +559,7 @@ export class SettingTab extends PluginSettingTab {
 			return true;
 		} catch {
 			rollback();
-			new Notice(options.failureMessage ?? "设置保存失败，请查看错误日志。", 6000);
+			new Notice(options.failureMessage ?? "Failed to save settings. Check the error log.", 6000);
 			if (options.refresh ?? true) {
 				this.display();
 			}
@@ -638,7 +569,7 @@ export class SettingTab extends PluginSettingTab {
 
 	private formatRuntimeLogEntries(entries: RuntimeLogEntry[]): string {
 		if (entries.length === 0) {
-			return "暂无运行日志。";
+			return "No runtime logs.";
 		}
 
 		return entries
@@ -647,7 +578,7 @@ export class SettingTab extends PluginSettingTab {
 				const lines = [header, `  ${entry.message}`];
 				const meta = [entry.category, entry.provider].filter((item): item is string => Boolean(item));
 				if (meta.length > 0) {
-					lines.push(`  ${meta.join(" · ")}`);
+					lines.push(`  ${meta.join(" | ")}`);
 				}
 				if (entry.details && entry.details.length > 0) {
 					lines.push(...entry.details.map((detail) => `  - ${detail}`));
@@ -659,7 +590,7 @@ export class SettingTab extends PluginSettingTab {
 
 	private formatErrorLogEntries(entries: IndexErrorEntry[]): string {
 		if (entries.length === 0) {
-			return "暂无错误日志。";
+			return "No error logs.";
 		}
 
 		return entries
@@ -671,7 +602,7 @@ export class SettingTab extends PluginSettingTab {
 					entry.stage ? `stage=${entry.stage}` : undefined,
 				].filter((item): item is string => Boolean(item));
 				if (meta.length > 0) {
-					lines.push(`  ${meta.join(" · ")}`);
+					lines.push(`  ${meta.join(" | ")}`);
 				}
 				if (entry.details && entry.details.length > 0) {
 					lines.push(...entry.details.map((detail) => `  - ${detail}`));

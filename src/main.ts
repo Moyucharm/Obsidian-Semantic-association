@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Plugin entrypoint.
  */
 
@@ -103,25 +103,25 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		this.addCommand({
 			id: "open-connections-view",
-			name: "打开关联视图",
+			name: "Open Connections View",
 			callback: () => this.activateView(VIEW_TYPE_CONNECTIONS),
 		});
 
 		this.addCommand({
 			id: "open-lookup-view",
-			name: "打开语义搜索",
+			name: "Open Semantic Search",
 			callback: () => this.activateView(VIEW_TYPE_LOOKUP),
 		});
 
 		this.addCommand({
 			id: "rebuild-index",
-			name: "重建索引",
+			name: "Rebuild Index",
 			callback: () => this.rebuildIndex(),
 		});
 
 		this.addCommand({
 			id: "show-index-storage-summary",
-			name: "显示索引统计",
+			name: "Show Index Storage Summary",
 			callback: () => {
 				void this.showIndexStorageSummary();
 			},
@@ -154,12 +154,6 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			| (Partial<SemanticConnectionsSettings> & Record<string, unknown>)
 			| null;
 		const loaded = raw ?? {};
-		const storedEmbeddingProvider =
-			typeof loaded.embeddingProvider === "string" ? loaded.embeddingProvider : "";
-		const embeddingProvider =
-			storedEmbeddingProvider === "mock" || storedEmbeddingProvider === "remote"
-				? storedEmbeddingProvider
-				: DEFAULT_SETTINGS.embeddingProvider;
 
 		this.settings = {
 			maxConnections:
@@ -169,7 +163,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			excludedFolders: Array.isArray(loaded.excludedFolders)
 				? loaded.excludedFolders.filter((folder): folder is string => typeof folder === "string")
 				: DEFAULT_SETTINGS.excludedFolders,
-			embeddingProvider,
+			embeddingProvider: DEFAULT_SETTINGS.embeddingProvider,
 			autoIndex:
 				typeof loaded.autoIndex === "boolean"
 					? loaded.autoIndex
@@ -295,7 +289,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				throw new Error("Error log clear was not persisted.");
 			}
 		} catch (error) {
-			await this.logRuntimeEvent("error-log-clear-failed", "清空错误日志失败。", {
+			await this.logRuntimeEvent("error-log-clear-failed", "Failed to clear the error log.", {
 				level: "warn",
 				category: "storage",
 				details: [
@@ -417,7 +411,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		await this.errorLogger.cleanupIfNeeded();
 		await this.runtimeLogger.load();
 		await this.runtimeLogger.cleanupIfNeeded();
-		await this.logRuntimeEvent("startup-sequence-started", "插件进入 layout-ready 阶段。", {
+		await this.logRuntimeEvent("startup-sequence-started", "Plugin entered the layout-ready stage.", {
 			category: "lifecycle",
 		});
 
@@ -426,25 +420,25 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 		if (this.settings.autoOpenConnectionsView) {
 			await this.ensureViewOpen(VIEW_TYPE_CONNECTIONS);
-			await this.logRuntimeEvent("connections-view-auto-opened", "已自动打开关联视图。", {
+			await this.logRuntimeEvent("connections-view-auto-opened", "Connections view opened automatically.", {
 				category: "lifecycle",
 			});
 		}
 
 		if (this.noteStore.size === 0) {
 			if (this.indexSnapshotIncompatible) {
-				new Notice("索引快照与当前 embedding 配置或切块策略不兼容，请手动执行“重建索引”。", 8000);
+				new Notice("Detected an index snapshot that is incompatible with the current embedding or chunking configuration. Loading was skipped. Please rebuild the index manually.", 8000);
 			} else if (
 				this.settings.embeddingProvider === "remote" &&
 				(!this.settings.remoteBaseUrl.trim() || !this.settings.remoteApiKey.trim())
 			) {
 				new Notice(
-					"当前使用远程 embeddings，但 API Base URL 或 API Key 未配置。请先完成配置，再手动执行“重建索引”。",
+					"Remote embeddings are enabled, but API Base URL or API Key is missing. Complete the configuration and rebuild the index manually.",
 					8000,
 				);
 				await this.logRuntimeEvent(
 					"startup-auto-rebuild-skipped",
-					"已跳过启动时自动重建，因为远程 embeddings 配置不完整。",
+					"Skipped automatic rebuild on startup because the remote embeddings configuration is incomplete.",
 					{
 						category: "lifecycle",
 						provider: "remote",
@@ -455,7 +449,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			}
 		}
 
-		await this.logRuntimeEvent("plugin-ready", "插件启动完成。", {
+		await this.logRuntimeEvent("plugin-ready", "Plugin startup completed.", {
 			category: "lifecycle",
 		});
 		console.log("Semantic Connections: ready");
@@ -590,16 +584,16 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		const emitProgress = (progress: RebuildIndexProgress): void => {
 			options?.onProgress?.(progress);
 		};
-		const notice = new Notice("正在重建语义索引...", 0);
+		const notice = new Notice("Rebuilding semantic index...", 0);
 
 		try {
 			emitProgress({
 				stage: "preparing",
-				message: "正在准备重建索引...",
+				message: "Preparing to rebuild the index...",
 				percent: 0,
 			});
 
-			await this.logRuntimeEvent("rebuild-index-started", "开始全量重建索引。", {
+			await this.logRuntimeEvent("rebuild-index-started", "Started a full index rebuild.", {
 				category: "indexing",
 			});
 			await this.errorLogger.clear();
@@ -612,8 +606,8 @@ export default class SemanticConnectionsPlugin extends Plugin {
 					const percent = totalNotes > 0 ? Math.round((done / totalNotes) * 100) : 100;
 					const message =
 						totalNotes > 0
-							? `正在构建语义索引... (${done}/${totalNotes})`
-							: "没有发现需要索引的笔记";
+							? `Building semantic index... (${done}/${totalNotes})`
+							: "No notes were found for indexing.";
 					emitProgress({
 						stage: "indexing",
 						message,
@@ -627,16 +621,16 @@ export default class SemanticConnectionsPlugin extends Plugin {
 
 			emitProgress({
 				stage: "saving",
-				message: "正在保存索引到磁盘...",
+				message: "Saving index to disk...",
 				percent: 100,
 			});
-			notice.setMessage("正在保存索引到磁盘...");
+			notice.setMessage("Saving index to disk...");
 			await this.saveIndexSnapshot();
 
 			const message =
 				failed > 0
-					? `索引完成：${this.noteStore.size} 篇笔记，失败 ${failed} 篇。`
-					: `索引完成：${this.noteStore.size} 篇笔记。`;
+					? `Index rebuild finished: ${this.noteStore.size} notes indexed, ${failed} failed.`
+					: `Index rebuild finished: ${this.noteStore.size} notes indexed.`;
 			emitProgress({
 				stage: "success",
 				message,
@@ -647,7 +641,9 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			notice.setMessage(message);
 			await this.logRuntimeEvent(
 				"rebuild-index-finished",
-				failed > 0 ? "全量重建索引完成，但存在失败项。" : "全量重建索引完成。",
+				failed > 0
+					? "Full index rebuild completed with failures."
+					: "Full index rebuild completed successfully.",
 				{
 					category: "indexing",
 					details: [
@@ -660,7 +656,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 			setTimeout(() => notice.hide(), failed > 0 ? 5000 : 3000);
 		} catch (error) {
 			const diagnostic = normalizeErrorDiagnostic(error);
-			const message = `重建索引失败：${diagnostic.message}`;
+			const message = `Index rebuild failed: ${diagnostic.message}`;
 			emitProgress({
 				stage: "error",
 				message,
@@ -756,27 +752,27 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		try {
 			const summary = await this.getIndexStorageSummary();
 			const lines = [
-				`索引统计：${summary.noteCount} 篇笔记，${summary.chunkCount} 个语义块，${summary.vectorCount} 个向量`,
-				`向量细分：note=${summary.noteVectorCount}，chunk=${summary.chunkVectorCount}，dimension=${summary.embeddingDimension}`,
-				`快照格式：${summary.snapshotFormat}`,
+				`Index summary: ${summary.noteCount} notes, ${summary.chunkCount} semantic chunks, ${summary.vectorCount} vectors`,
+				`Vector breakdown: note=${summary.noteVectorCount}, chunk=${summary.chunkVectorCount}, dimension=${summary.embeddingDimension}`,
+				`Snapshot format: ${summary.snapshotFormat}`,
 			];
 
 			if (summary.parts.length > 0) {
 				lines.push(
-					`总占用：${this.formatByteSize(summary.totalBytes)}`,
+					`Total size: ${this.formatByteSize(summary.totalBytes)}`,
 					...summary.parts.flatMap((part) => [
 						`${part.label}: ${this.formatByteSize(part.bytes)} (${(part.share * 100).toFixed(1)}%)`,
-						`路径：${part.path}`,
+						`Path: ${part.path}`,
 					]),
 				);
 			} else {
-				lines.push("尚未检测到已落盘的索引快照文件。");
+				lines.push("No persisted index snapshot files were found.");
 			}
 
 			new Notice(lines.join("\n"), 12000);
 			console.info("Semantic Connections index storage summary\n" + lines.join("\n"));
 		} catch (error) {
-			new Notice("读取索引存储统计失败，请查看错误日志。", 6000);
+			new Notice("Failed to read index storage statistics. Check the error log.", 6000);
 			await this.logRuntimeError("show-index-storage-summary", error, {
 				stage: "index-storage-summary",
 				errorType: "storage",
@@ -846,10 +842,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				chunkingStrategyMismatch
 			) {
 				this.indexSnapshotIncompatible = true;
-				new Notice(
-					"检测到索引快照与当前 embedding 配置或切块策略不兼容，已跳过加载。请手动执行“重建索引”。",
-					8000,
-				);
+				new Notice("Detected an index snapshot that is incompatible with the current embedding or chunking configuration. Loading was skipped. Please rebuild the index manually.", 8000);
 				return;
 			}
 
@@ -869,7 +862,7 @@ export default class SemanticConnectionsPlugin extends Plugin {
 				this.vectorStore.load(snapshot.vectorStore);
 			}
 
-			await this.logRuntimeEvent("index-snapshot-loaded", "已从磁盘恢复索引快照。", {
+			await this.logRuntimeEvent("index-snapshot-loaded", "Restored the index snapshot from disk.", {
 				category: "storage",
 				details: [
 					`notes=${this.noteStore.size}`,
@@ -998,3 +991,6 @@ export default class SemanticConnectionsPlugin extends Plugin {
 		}
 	}
 }
+
+
+

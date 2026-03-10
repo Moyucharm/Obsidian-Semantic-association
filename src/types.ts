@@ -79,7 +79,7 @@ export interface LookupResult {
 export interface SemanticConnectionsSettings {
 	maxConnections: number;
 	excludedFolders: string[];
-	embeddingProvider: "mock" | "remote";
+	embeddingProvider: "remote";
 	autoIndex: boolean;
 	autoOpenConnectionsView: boolean;
 	remoteBaseUrl: string;

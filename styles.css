@@ -1,6 +1,5 @@
-/* Semantic Connections 插件样式 */
+/* Semantic Connections plugin styles */
 
-/* 占位提示 */
 .sc-placeholder {
 	display: flex;
 	align-items: center;
@@ -14,7 +13,6 @@
 	font-size: 0.9em;
 }
 
-/* 搜索输入 */
 .sc-search-container {
 	padding: 8px;
 	border-bottom: 1px solid var(--background-modifier-border);
@@ -35,12 +33,10 @@
 	border-color: var(--interactive-accent);
 }
 
-/* 结果列表 */
 .sc-results-list {
 	padding: 4px 0;
 }
 
-/* 单条结果 */
 .sc-result-item {
 	padding: 8px 12px;
 	border-bottom: 1px solid var(--background-modifier-border);
@@ -51,7 +47,6 @@
 	background: var(--background-secondary);
 }
 
-/* 结果标题行 */
 .sc-result-header {
 	display: flex;
 	justify-content: space-between;
@@ -77,14 +72,12 @@
 	text-decoration: underline;
 }
 
-/* 分数 */
 .sc-result-score {
 	font-size: 0.8em;
 	color: var(--text-muted);
 	flex-shrink: 0;
 }
 
-/* 路径 */
 .sc-result-path {
 	font-size: 0.75em;
 	color: var(--text-faint);
@@ -94,7 +87,6 @@
 	white-space: nowrap;
 }
 
-/* Passage 区域 */
 .sc-result-passage {
 	margin-top: 4px;
 	padding: 6px 8px;
@@ -116,15 +108,11 @@
 	line-height: 1.4;
 }
 
-/* ── 设置页 ── */
-
-/* 错误日志提示 */
 .sc-setting-error-hint {
 	color: var(--text-error);
 	font-size: 0.85em;
 }
 
-/* API 测试结果 */
 .sc-api-test-result {
 	margin-top: 6px;
 	padding: 4px 8px;
@@ -142,79 +130,6 @@
 	background: rgba(var(--background-modifier-error-rgb), 0.1);
 }
 
-/* 模型列表加载状态提示 */
-.sc-model-fetch-hint {
-	font-size: 0.85em;
-	color: var(--text-muted);
-	margin-top: 4px;
-}
-
-.sc-model-fetch-hint.is-error {
-	color: var(--text-error);
-}
-
-/* 手动输入模型名称容器 */
-.sc-manual-model-input {
-	margin-top: 6px;
-	width: 100%;
-}
-
-/* 本地模型测试结果 */
-.sc-local-test-result {
-	margin-top: 6px;
-	padding: 4px 8px;
-	border-radius: 4px;
-	font-size: 0.85em;
-}
-
-.sc-local-test-result.is-success {
-	color: var(--text-success, #4caf50);
-	background: rgba(76, 175, 80, 0.1);
-}
-
-.sc-local-test-result.is-error {
-	color: var(--text-error);
-	background: rgba(var(--background-modifier-error-rgb), 0.1);
-}
-
-/* 本地模型下载状态 */
-.sc-local-download-status {
-	margin-top: 8px;
-	padding: 8px;
-	border: 1px solid var(--background-modifier-border);
-	border-radius: 6px;
-	background: var(--background-secondary);
-}
-
-.sc-local-download-status.is-success {
-	border-color: var(--text-success, #4caf50);
-}
-
-.sc-local-download-status.is-error {
-	border-color: var(--text-error);
-}
-
-.sc-local-download-progress {
-	height: 6px;
-	border-radius: 999px;
-	background: var(--background-modifier-border);
-	overflow: hidden;
-}
-
-.sc-local-download-progress-bar {
-	width: 0;
-	height: 100%;
-	background: var(--interactive-accent);
-	transition: width 150ms ease;
-}
-
-.sc-local-download-detail {
-	margin-top: 6px;
-	font-size: 0.82em;
-	color: var(--text-muted);
-	word-break: break-all;
-}
-
 .sc-log-output {
 	margin-top: 8px;
 	padding: 8px;
@@ -230,7 +145,6 @@
 	overflow: auto;
 }
 
-/* 重建索引状态 */
 .sc-rebuild-status {
 	margin-top: 8px;
 	padding: 8px;
