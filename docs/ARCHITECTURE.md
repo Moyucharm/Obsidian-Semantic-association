@@ -1,93 +1,92 @@
-# Semantic Connections Architecture
+# 语义关联（Semantic Connections）架构说明
 
-## Overview
+## 概览
 
-The plugin uses a single embedding provider, `remote`, and sends requests to an OpenAI-compatible `/v1/embeddings` endpoint.
+本插件当前只支持一个 embedding provider：`remote`，并向 **OpenAI 兼容**的 `/v1/embeddings` 接口发送请求生成向量。
 
-The default remote model is `BAAI/bge-m3`. Internally the plugin only works with one dense vector per text, represented as `number[]`.
+- 默认远程模型：`BAAI/bge-m3`
+- 插件内部只处理 **单一 dense 向量**：`number[]`（每段文本对应一个向量）
 
-## Layers
+## 分层（Layers）
 
-### UI
+### UI（视图 / 命令 / 设置）
 
 - `src/views/connections-view.ts`
 - `src/views/lookup-view.ts`
 - `src/settings.ts`
 
-This layer renders views, commands, and settings. It does not own indexing or retrieval logic.
+该层负责渲染视图、注册命令与设置项，本身不实现索引或检索算法。
 
-### Indexing
+### Indexing（扫描 / 切分 / 索引）
 
 - `src/indexing/scanner.ts`
 - `src/indexing/chunker.ts`
 - `src/indexing/reindex-service.ts`
 - `src/indexing/reindex-queue.ts`
 
-This layer scans markdown files, splits them into chunks, runs full rebuilds, and processes incremental updates.
+该层负责扫描 Markdown、切分 chunk、执行全量重建，以及在需要时处理 delete/rename 等任务；同时提供“同步变动笔记/重试失败项”等手动入口，以避免后台自动消耗远程 Embeddings API。
 
-### Embeddings
+### Embeddings（向量生成）
 
 - `src/embeddings/provider.ts`
 - `src/embeddings/remote-provider.ts`
 - `src/embeddings/embedding-service.ts`
 
-`EmbeddingService` is the single entry point used by indexing and search. The main operations are:
+`EmbeddingService` 是索引与搜索共用的唯一入口，主要操作：
 
 - `embed(text)`
 - `embedBatch(texts)`
 
-### Storage
+### Storage（本地存储）
 
 - `src/storage/note-store.ts`
 - `src/storage/chunk-store.ts`
 - `src/storage/vector-store.ts`
 
-The on-disk index is composed of:
+磁盘索引快照由两部分组成：
 
-- `index-store.json`
-- `index-vectors.bin`
+- `index-store.json`（结构化元数据快照）
+- `index-vectors.bin`（向量快照，Float32 二进制）
 
-### Search
+### Search（检索）
 
 - `src/search/connections-service.ts`
 - `src/search/lookup-service.ts`
 - `src/search/passage-selector.ts`
 
-## Chunking Strategy
+## Chunk 切分策略（Chunking Strategy）
 
-The current chunking strategy is `paragraph-first-v3-overlap20`.
+当前切分策略：`paragraph-first-v3-overlap20`。
 
-Main behavior:
+主要行为：
 
-1. Split markdown into sections by heading.
-2. Remove YAML frontmatter before chunking.
-3. Keep the heading in metadata instead of inserting it directly into chunk text.
-4. Prefer paragraph boundaries when building chunks.
-5. Merge very short adjacent paragraphs when possible.
-6. Split overly long paragraphs again using sentence, clause, or whitespace boundaries.
-7. Add a sliding-window overlap (20% of `maxChunkLength`) between adjacent chunks.
+1. 按标题（heading）把 markdown 拆成段落语境。
+2. 切分前移除 YAML frontmatter。
+3. 标题保存在元数据里，不直接插入 chunk 的正文文本。
+4. 构建 chunk 时优先使用段落边界。
+5. 尽可能合并非常短的相邻段落。
+6. 对过长段落再按句子/分句/空白边界进一步拆分。
+7. 相邻 chunk 采用滑动窗口重叠（overlap），默认是 `maxChunkLength` 的 20%。
 
-Current limits (chunker output):
+当前限制（chunker 输出，按字符数计算）：
 
 - `minChunkLength = 300`
 - `maxChunkLength = 800`
-- `overlap = 20%` (≈160 chars when `maxChunkLength = 800`, stride ≈640)
+- `overlap = 20%`（`maxChunkLength = 800` 时约 160 字符，stride 约 640）
 
-These limits are local chunking guards (character counts) and are not remote model token limits.
+这些限制是本地切分的字符数护栏，不等同于远程模型的 token 限制。
 
-Note: `ReindexService` still enforces a `1200` character limit on the final embedding payload
-(`{heading}\n\n{text}`), so when a heading is present the allowed `text` length is reduced and the chunk
-may be split again during indexing.
+注意：`ReindexService` 会对最终 embedding payload 再做一次长度校验，限制为 `1200` 字符（payload 形如 `{heading}\n\n{text}`）。当标题存在时，正文 `text` 的可用长度会被压缩，索引阶段可能再次拆分。
 
-## Heading Context
+## 标题上下文（Heading Context）
 
-Chunks still store:
+Chunk 元数据仍然保留：
 
 - `heading`
 - `text`
 - `order`
 
-When building the embedding payload, `ReindexService` sends:
+构建 embedding payload 时，`ReindexService` 发送：
 
 ```text
 {heading}
@@ -95,18 +94,17 @@ When building the embedding payload, `ReindexService` sends:
 {text}
 ```
 
-If a chunk has no heading, only the text is sent.
+若 chunk 没有标题，则只发送正文文本。
 
-This keeps rendered passage text clean while still letting embeddings use heading context.
+这样做可以让 UI 渲染的片段保持“干净”，同时 embedding 仍能利用标题上下文。
 
-Heading context is truncated to 200 characters (with an ellipsis) before being prepended, to keep
-payloads bounded and avoid extremely long headings dominating embeddings.
+为避免超长标题主导 embedding，标题上下文会在拼接前截断到 200 字符（并追加省略号）。
 
-## Remote Provider
+## 远程 Provider（remote）
 
-### Request Format
+### 请求格式（Request Format）
 
-The plugin sends requests like:
+插件发送的请求形如：
 
 ```http
 POST {baseUrl}/v1/embeddings
@@ -121,9 +119,9 @@ Content-Type: application/json
 }
 ```
 
-### Response Shape
+### 响应结构（Response Shape）
 
-The plugin expects:
+插件期望响应形如：
 
 ```json
 {
@@ -134,82 +132,85 @@ The plugin expects:
 }
 ```
 
-### Input Safety
+### 输入安全（Input Safety）
 
-Before sending a remote request, the plugin:
+发起远程请求前，插件会：
 
-- strips frontmatter
-- skips empty chunks
-- splits overly long chunks locally
-- validates the final `heading + text` payload length again
-- avoids calling `embedBatch([])`
+- 去除 frontmatter
+- 跳过空 chunk
+- 本地拆分过长 chunk
+- 重新校验最终 `heading + text` payload 长度
+- 避免调用 `embedBatch([])`
 
-## Indexing Flow
+## 索引流程（Indexing Flow）
 
-### Startup
+### 启动（Startup）
 
-Startup order in `src/main.ts`:
+`src/main.ts` 的启动顺序：
 
 1. `loadSettings()`
 2. `createServices()`
-3. register views, commands, and settings
+3. 注册 views / commands / settings
 4. `onLayoutReady()`
 
-### Layout Ready
+### 布局就绪（Layout Ready）
 
-`onLayoutReady()`:
+`onLayoutReady()` 的关键步骤：
 
-1. loads runtime and error logs
-2. attempts to restore the saved index snapshot
-3. registers file events (used for incremental indexing when enabled)
-4. auto-opens the Connections view if configured
-5. reminds the user to rebuild the index when needed (no automatic full rebuild by default)
+1. 加载运行日志与错误日志
+2. 尝试恢复磁盘索引快照（`index-store.json` + `index-vectors.bin`）
+3. 注册文件事件（仅在开启 `autoIndex` 时生效：用于标记 dirty/outdated、处理 delete/rename 等）
+4. 按配置自动打开右侧关联视图
+5. 必要时提醒用户手动重建索引（默认不会自动全量重建，以避免意外远程 API 消耗）
 
-The plugin tracks `lastFullRebuildAt` and shows a startup reminder when the last full rebuild is older
-than 7 days. Rebuilds are user-triggered (command or Settings UI) to avoid surprise remote API usage.
+插件会记录 `lastFullRebuildAt`，当距离上次全量重建 ≥ 7 天时，在启动时弹出提醒（仍需用户手动触发“重建索引”）。
 
-### Full Rebuild
+### 全量重建（Full Rebuild）
 
-`rebuildIndex()`:
+`rebuildIndex()` 的高层流程：
 
-1. clears previous error logs
-2. clears in-memory index state
-3. runs `ReindexService.indexAll(...)`
-4. saves the index snapshot
-5. updates UI progress and runtime logs
+1. 清理旧的错误日志
+2. 清空内存索引状态（NoteStore/ChunkStore/VectorStore）
+3. 执行 `ReindexService.indexAll(...)`
+4. 保存索引快照
+5. 更新 UI 进度与运行日志
 
-## Connections Ranking
+### 同步变动笔记（手动）
 
-`ConnectionsService` retrieves related notes by searching chunk vectors directly and then aggregating
-chunk hits back to notes. This avoids "big note semantic dilution" where a note-level mean vector can
-become too generic to be recalled.
+插件不会在后台自动为每次编辑调用 embedding。要让索引“变得更准”，需要你手动触发同步：
 
-High-level flow:
+- 命令 `Sync Changed Notes（同步变动笔记）` 会扫描 Vault，找出新增/修改/标记为 dirty 的笔记，确认后逐篇生成 embedding 并更新索引。
+- 若索引过程中出现网络中断/429 等可重试错误，会记录到 `failed-tasks.json`，之后可通过“重试失败项”再次处理。
 
-1. choose a query vector for the current note (prefer the persisted note-level vector; fall back to
-   the mean of current chunk vectors when missing)
-2. search across all chunk vectors (`id` contains `#`) and collect the topK chunk hits
-3. group hits by `notePath` (derived from `chunkId`)
-4. for each candidate note:
-   - rescore candidate chunks against the current note's chunk vectors (`PassageSelector`)
-   - sort passages by similarity and truncate to `maxPassagesPerNote`
-   - compute `passageScore` using log-sum-exp aggregation (softmax pooling) for transparency
-   - rank notes using `finalScore = bestPassage.score` (the "strongest snippet" shown in UI)
-   - apply `minSimilarityScore` as a soft threshold (top results are still returned to avoid an empty UI)
+## 关联视图排序（Connections Ranking）
 
-`ConnectionResult` keeps:
+`ConnectionsService` 通过 **直接检索 chunk 向量** 并回聚到笔记，避免“大笔记 note-level 均值向量语义稀释”导致的召回问题。
 
-- `score` (finalScore, equals `bestPassage.score`)
-- `noteScore` (alias of `bestPassage.score`, kept for backwards compatibility)
-- `passageScore` (aggregated)
-- `bestPassage` (highest scoring chunk, used for snippet preview)
-- `passages` (all matched passages after thresholding)
+高层流程：
 
-## Snapshot Compatibility
+1. 为当前笔记选择查询向量：优先使用已持久化的 note-level 向量；缺失时用当前笔记 chunk 向量的均值兜底。
+2. 在全量 chunk 向量中检索（`id` 包含 `#`），得到 topK chunk 命中。
+3. 按 `notePath`（由 `chunkId` 解析得到）把命中聚合成候选笔记。
+4. 对每篇候选笔记：
+   - 使用 `PassageSelector` 对候选笔记 chunks 重新打分（候选 chunk 与当前笔记所有 chunk 的最大相似度）
+   - 按相似度排序，并按 `maxPassagesPerNote` 截断
+   - 计算 `passageScore`（log-sum-exp 聚合）用于透明化展示
+   - 排序主分数使用 `finalScore = bestPassage.score`（让 UI 展示的“最强片段”与排序口径一致）
+   - 将 `minSimilarityScore` 作为软阈值：仍会保留少量 top-N 兜底结果，避免 UI 为空
 
-The current snapshot version is `3`.
+`ConnectionResult` 会保留：
 
-Snapshot compatibility checks include:
+- `score`（finalScore，等于 `bestPassage.score`）
+- `noteScore`（与 `bestPassage.score` 等价，兼容字段）
+- `passageScore`（聚合分数）
+- `bestPassage`（最高分 chunk，用于片段预览）
+- `passages`（截断后的候选片段集合）
+
+## 快照兼容性（Snapshot Compatibility）
+
+当前快照版本为 `3`。
+
+快照兼容性校验字段包括：
 
 - `embeddingProvider`
 - `remoteBaseUrl`
@@ -218,21 +219,21 @@ Snapshot compatibility checks include:
 - `chunkingStrategy`
 - `noteVectorStrategy`
 
-If any of these change, the snapshot is skipped and the user is asked to rebuild the index.
+其中任一变化都会导致跳过加载快照，并提示用户手动重建索引。
 
-## Local Files
+## 本地文件（Local Files）
 
-Local test configuration is stored in `data.json`. This file and `debug-artifacts/` are ignored by `.gitignore` and should not be committed.
+本地测试配置保存在 `data.json`。该文件以及 `debug-artifacts/` 已在 `.gitignore` 中忽略，不应提交到仓库。
 
-## Build
+## 构建（Build）
 
 ```bash
 npm run build
 ```
 
-Build outputs:
+构建产物：
 
 - `main.js`
-- `dist/main.js` (dist is cleaned on production builds)
+- `dist/main.js`（生产构建会清理 `dist/` 后再复制）
 - `dist/manifest.json`
 - `dist/styles.css`

@@ -22,7 +22,7 @@
 - 当前活动叶子（正在编辑/阅读的笔记）变化时刷新
 - 当前笔记文件被修改时刷新（仅刷新 UI 结果；是否“变得更准”取决于索引是否最新）
 
-> 注意：如果你开启了「增量索引」，文件修改会触发后台索引更新（可能产生远程 embeddings API 调用）；但“关联视图的查询/渲染”本身不调用 embedding。
+> 注意：开启 `监听文件变更（仅本地标记）`（`autoIndex`）后，文件修改只会标记为“待同步/可能过时”，**不会**自动调用远程 embeddings API；关联视图的查询/渲染本身也不调用 embedding。需要你手动执行 `同步变动笔记`（或 `重建索引`）才会真正更新向量与结果。
 
 ## 2) 「索引」到底是什么？（索引图概念）
 
@@ -70,7 +70,7 @@ erDiagram
   }
 ```
 
-## 3) 索引如何更新？（全量重建 vs 增量索引）
+## 3) 索引如何更新？（全量重建 vs 变动同步）
 
 ### 3.1 全量重建（手动）
 
@@ -111,34 +111,36 @@ flowchart TD
   E -- 否 --> G[无提示]
 ```
 
-### 3.3 增量索引（可选开关，默认关闭）
+### 3.3 监听文件变更（仅本地标记，默认关闭）
 
-增量索引的意义：当你频繁编辑/新增笔记时，只更新“变动的那几篇”，避免每次都全量重建。
+这个开关（`autoIndex`）的目标是：在你频繁编辑时，尽快把“哪些笔记需要同步”标记出来，并在删除/重命名时维护索引的一致性，同时避免在后台自动消耗远程 Embeddings API。
 
-当设置项 `增量索引（监听文件变更）`（`autoIndex`）开启后：
+开启后插件会：
 
-- 监听 create/modify/delete/rename
-- 进入 `ReindexQueue` 防抖去重（默认 1000ms）
-- 执行 `ReindexService.processTask()`
-  - modify/create：会做 hash 对比，内容没变就跳过
-    - 内容有变时，会先生成新向量；生成成功后再替换 ChunkStore，并删除该文件旧的 note/chunk 向量，避免旧索引残留
-  - delete：级联删除该笔记相关 chunks/vectors
-  - rename：先迁移各 Store 的 key/id；若内容未变，仅更新 NoteStore 元数据；若内容有变，才会走完整 `indexFile` 流程重新计算 embedding
-- 之后会延迟合并写盘（`scheduleIndexSave()`，10 秒聚合保存一次）
+- **create/modify**：在编辑停止一小段时间后读取内容并计算 hash；若检测到与已索引版本不一致，则把该笔记标记为 `dirty/outdated`（仅本地标记，**不自动调用** embedding）。
+- **delete**：把 delete 任务加入 `ReindexQueue`（防抖/去重），并级联清理 Note/Chunks/Vectors。
+- **rename**：把 rename 任务加入 `ReindexQueue`，迁移各 Store 的 key/id；必要时刷新 NoteMeta。若检测到内容有变，则只标记为待同步。
+
+要真正更新向量并让结果“变得更准”，需要你手动触发一次远程嵌入：
+
+- 命令 `Sync Changed Notes（同步变动笔记）`：扫描并列出新增/修改/待同步的笔记，确认后逐篇生成 embedding 并写回索引。
+- 或在关联视图的提示条点击 `[立即同步]`（只同步当前笔记）。
 
 ```mermaid
 flowchart TD
   A[文件事件: create/modify/delete/rename] --> B{autoIndex 开启?}
   B -- 否 --> X[忽略]
-  B -- 是 --> C[ReindexQueue.enqueue 防抖/去重]
-  C --> D[flush -> ReindexService.processTask]
-  D --> E{任务类型}
-  E -- modify/create --> F[indexFile: hash 检查 -> chunk -> embedBatch -> 替换 chunks/删除旧 vectors -> 写入新 vectors]
-  E -- delete --> G[removeFile: 删 Note/Chunks/Vectors]
-  E -- rename --> H[renameFile: 迁移 id -> 仅必要时重建 embedding]
-  F --> I[scheduleIndexSave 10s 合并写盘]
-  G --> I
-  H --> I
+  B -- 是 --> C{事件类型}
+  C -- create/modify --> D[scheduleDirtyCheck -> 计算 hash -> 标记 dirty/outdated]
+  C -- delete/rename --> E[ReindexQueue.enqueue 防抖/去重]
+  E --> F[flush -> ReindexService.processTask(delete/rename)]
+  D --> G[scheduleIndexSave 10s 合并写盘]
+  F --> G
+
+  H[命令: 同步变动笔记] --> I[扫描 Vault 变动/新增笔记]
+  I --> J[用户确认]
+  J --> K[逐篇 indexFile -> 远程 embeddings]
+  K --> G
 ```
 
 ## 4) 「关联视图」到底在匹配什么？（笔记 vs 段落）
