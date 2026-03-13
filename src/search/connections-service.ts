@@ -13,15 +13,19 @@ import type { ConnectionResult, PassageResult, Vector } from "../types";
 import { NoteStore } from "../storage/note-store";
 import { ChunkStore } from "../storage/chunk-store";
 import { VectorStore } from "../storage/vector-store";
+import { PassageSelector } from "./passage-selector";
 
 const PASSAGE_AGGREGATION_BETA = 10;
 
 export class ConnectionsService {
+	private passageSelector: PassageSelector;
+
 	constructor(
 		private noteStore: NoteStore,
 		private chunkStore: ChunkStore,
 		private vectorStore: VectorStore,
 	) {
+		this.passageSelector = new PassageSelector(this.chunkStore, this.vectorStore);
 	}
 
 	private isExcludedPath(path: string, excludedFolders: string[]): boolean {
@@ -68,15 +72,13 @@ export class ConnectionsService {
 		const excludedFolders = options?.excludedFolders ?? [];
 		const fallbackCount = Math.min(5, Math.max(0, maxConnections));
 
+		const currentChunks = this.chunkStore.getByNote(notePath);
+		const currentChunkVectors: Vector[] = currentChunks
+			.map((c) => this.vectorStore.get(c.chunkId))
+			.filter((v): v is Vector => v !== undefined);
+
 		// 查询向量：优先使用已持久化的 note-level 向量；缺失时用当前 chunks 的均值兜底。
-		let queryVector = this.vectorStore.get(notePath);
-		if (!queryVector) {
-			const currentChunks = this.chunkStore.getByNote(notePath);
-			const currentChunkVectors: Vector[] = currentChunks
-				.map((c) => this.vectorStore.get(c.chunkId))
-				.filter((v): v is Vector => v !== undefined);
-			queryVector = this.meanVector(currentChunkVectors);
-		}
+		let queryVector = this.vectorStore.get(notePath) ?? this.meanVector(currentChunkVectors);
 
 		if (!queryVector) {
 			return [];
@@ -94,8 +96,9 @@ export class ConnectionsService {
 			return [];
 		}
 
-		// 将命中的 chunks 按 notePath 聚合
-		const passagesByNote = new Map<string, PassageResult[]>();
+		// 将命中的 chunks 按 notePath 聚合（用于候选笔记粗筛）
+		const seedPassagesByNote = new Map<string, PassageResult[]>();
+		const seedBestScoreByNote = new Map<string, number>();
 
 		for (const match of rawChunkMatches) {
 			const chunkId = match.id;
@@ -116,23 +119,37 @@ export class ConnectionsService {
 				continue;
 			}
 
-			const passages = passagesByNote.get(candidateNotePath) ?? [];
+			const passages = seedPassagesByNote.get(candidateNotePath) ?? [];
 			passages.push({
 				chunkId,
 				heading: chunk.heading,
 				text: chunk.text,
 				score: match.score,
 			});
-			passagesByNote.set(candidateNotePath, passages);
+			seedPassagesByNote.set(candidateNotePath, passages);
+
+			const existingSeed = seedBestScoreByNote.get(candidateNotePath);
+			if (existingSeed === undefined || match.score > existingSeed) {
+				seedBestScoreByNote.set(candidateNotePath, match.score);
+			}
 		}
 
-		if (passagesByNote.size === 0) {
+		if (seedPassagesByNote.size === 0) {
 			return [];
 		}
 
+		const candidateNoteLimit = Math.min(
+			seedPassagesByNote.size,
+			Math.max(30, maxConnections * 5),
+		);
+		const candidateNotePaths = Array.from(seedBestScoreByNote.entries())
+			.sort((a, b) => b[1] - a[1])
+			.slice(0, candidateNoteLimit)
+			.map(([path]) => path);
+
 		const results: ConnectionResult[] = [];
 
-		for (const [candidateNotePath, passages] of passagesByNote) {
+		for (const candidateNotePath of candidateNotePaths) {
 			if (this.isExcludedPath(candidateNotePath, excludedFolders)) {
 				continue;
 			}
@@ -140,6 +157,21 @@ export class ConnectionsService {
 			const candidateMeta = this.noteStore.get(candidateNotePath);
 			if (!candidateMeta) {
 				continue;
+			}
+
+			const seedPassages = seedPassagesByNote.get(candidateNotePath) ?? [];
+
+			let passages: PassageResult[] = seedPassages;
+			if (currentChunkVectors.length > 0) {
+				const passageLimit = maxPassagesPerNote > 0 ? maxPassagesPerNote : 20;
+				const selected = this.passageSelector.selectMatches(
+					candidateNotePath,
+					currentChunkVectors,
+					{ maxResults: passageLimit },
+				);
+				if (selected.length > 0) {
+					passages = selected;
+				}
 			}
 
 			passages.sort((a, b) => b.score - a.score);
@@ -155,9 +187,9 @@ export class ConnectionsService {
 				trimmedPassages.map((passage) => passage.score),
 			);
 
-			// 兼容现有 UI：noteScore 用“最佳段落分数”表示，最终排序用聚合分数。
+			// 用“最强关联片段”作为主分数（便于 UI 直觉理解），保留聚合分数用于透明化展示。
 			const noteScore = bestPassage.score;
-			const finalScore = passageScore;
+			const finalScore = noteScore;
 
 			results.push({
 				notePath: candidateNotePath,

@@ -123,11 +123,11 @@ Connection ranking is not pure note-level similarity.
 The current formula is:
 
 ```text
-finalScore = noteScore * 0.7 + passageScore * 0.3
+finalScore = bestPassage.score
 ```
 
-This means a note can move up or down depending on passage matching, which is aggregated over the
-matched passages after thresholding and truncation.
+`passageScore` is still computed via log-sum-exp over the top passages and exposed for transparency,
+but the UI headline score follows the best matching snippet so the ranking matches what you see.
 
 ## #010 Why do I see fewer connections or no passages?
 
@@ -143,12 +143,12 @@ Connections are computed in two stages:
 1. note-level recall returns candidates
 2. chunk-level passage matching applies a similarity threshold
 
-If `minPassageScore` is too high, candidates can be dropped because none of their passages
-pass the threshold.
+If `minSimilarityScore` is too high, fewer results will survive the soft threshold (the UI will still
+show a small top-N fallback and mark results below the threshold as "weak").
 
 Fix:
 
-1. Lower the passage similarity threshold (`minPassageScore`)
+1. Lower the relevance threshold (`minSimilarityScore`)
 2. Increase `maxPassagesPerNote` (or set it to `0` to disable truncation)
 3. Rebuild the index if you suspect stale or missing chunk vectors
 

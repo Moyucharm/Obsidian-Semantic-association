@@ -11,6 +11,15 @@ node_modules/
 .idea/
 .vscode/
 
+# OS
+.DS_Store
+Thumbs.db
+
+# tooling caches
+*.tsbuildinfo
+.eslintcache
+*.log
+
 # env
 .env
 .env.*
@@ -23,4 +32,3 @@ test-credentials.json
 data.json
 
 # project docs
-CLAUDE.md

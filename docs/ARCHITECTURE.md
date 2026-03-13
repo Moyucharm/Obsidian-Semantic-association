@@ -55,7 +55,7 @@ The on-disk index is composed of:
 
 ## Chunking Strategy
 
-The current chunking strategy is `paragraph-first-v2`.
+The current chunking strategy is `paragraph-first-v3-overlap20`.
 
 Main behavior:
 
@@ -65,15 +65,17 @@ Main behavior:
 4. Prefer paragraph boundaries when building chunks.
 5. Merge very short adjacent paragraphs when possible.
 6. Split overly long paragraphs again using sentence, clause, or whitespace boundaries.
+7. Add a sliding-window overlap (20% of `maxChunkLength`) between adjacent chunks.
 
-Current limits:
+Current limits (chunker output):
 
-- `minChunkLength = 50`
-- `maxChunkLength = 1200`
+- `minChunkLength = 300`
+- `maxChunkLength = 800`
+- `overlap = 20%` (≈160 chars when `maxChunkLength = 800`, stride ≈640)
 
-These limits are local safety guards for indexing and are not remote model token limits.
+These limits are local chunking guards (character counts) and are not remote model token limits.
 
-Note: `ReindexService` enforces the same `1200` character limit on the final embedding payload
+Note: `ReindexService` still enforces a `1200` character limit on the final embedding payload
 (`{heading}\n\n{text}`), so when a heading is present the allowed `text` length is reduced and the chunk
 may be split again during indexing.
 
@@ -189,17 +191,18 @@ High-level flow:
 2. search across all chunk vectors (`id` contains `#`) and collect the topK chunk hits
 3. group hits by `notePath` (derived from `chunkId`)
 4. for each candidate note:
-   - filter passages by `minPassageScore`
+   - rescore candidate chunks against the current note's chunk vectors (`PassageSelector`)
    - sort passages by similarity and truncate to `maxPassagesPerNote`
-   - compute `passageScore` using log-sum-exp aggregation (softmax pooling)
-   - rank notes using `finalScore = passageScore`
-   - expose `noteScore` as the best passage score for UI display
+   - compute `passageScore` using log-sum-exp aggregation (softmax pooling) for transparency
+   - rank notes using `finalScore = bestPassage.score` (the "strongest snippet" shown in UI)
+   - apply `minSimilarityScore` as a soft threshold (top results are still returned to avoid an empty UI)
 
 `ConnectionResult` keeps:
 
-- `score` (finalScore)
-- `noteScore` (best passage score)
+- `score` (finalScore, equals `bestPassage.score`)
+- `noteScore` (alias of `bestPassage.score`, kept for backwards compatibility)
 - `passageScore` (aggregated)
+- `bestPassage` (highest scoring chunk, used for snippet preview)
 - `passages` (all matched passages after thresholding)
 
 ## Snapshot Compatibility

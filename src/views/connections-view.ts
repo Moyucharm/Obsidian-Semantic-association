@@ -114,7 +114,7 @@ export class ConnectionsView extends ItemView {
 
 			if (results.length === 0) {
 				this.renderEmpty(
-					"暂无关联笔记。建议尝试同步更多笔记或调整匹配阈值。",
+					"暂无关联笔记。建议尝试同步更多笔记或调整相关度阈值。",
 					file,
 				);
 			} else {
@@ -245,15 +245,25 @@ export class ConnectionsView extends ItemView {
 		});
 	}
 
-	private mapSimilarityToPercent(rawScore: number): number {
-		const score = Math.max(0, Math.min(1, rawScore));
-		if (score <= 0.2) {
-			return Math.round((score / 0.2) * 40);
+	private formatPercent(score: number, decimals: number = 1): string {
+		if (!Number.isFinite(score)) {
+			return "--%";
 		}
-		if (score <= 0.5) {
-			return Math.round(40 + ((score - 0.2) / 0.3) * 50);
+
+		const percent = score * 100;
+		const precision = Math.pow(10, decimals);
+		const rounded = Math.round(percent * precision) / precision;
+		if (Number.isInteger(rounded)) {
+			return `${rounded.toFixed(0)}%`;
 		}
-		return Math.round(90 + ((score - 0.5) / 0.5) * 10);
+		return `${rounded.toFixed(decimals)}%`;
+	}
+
+	private formatRawScore(score: number, decimals: number = 3): string {
+		if (!Number.isFinite(score)) {
+			return "--";
+		}
+		return score.toFixed(decimals);
 	}
 
 	private renderResultItem(parent: Element, result: ConnectionResult): void {
@@ -273,20 +283,22 @@ export class ConnectionsView extends ItemView {
 		const rawSimilarity = result.bestPassage.score;
 		const threshold = this.plugin.settings.minSimilarityScore;
 		const isWeak = rawSimilarity < threshold;
-		const mappedPercent = this.mapSimilarityToPercent(rawSimilarity);
+		const percentText = this.formatPercent(rawSimilarity);
+		const rawSimilarityText = this.formatRawScore(rawSimilarity);
 
 		const scoreEl = header.createEl("span", {
-			text: `匹配度 ${mappedPercent}%${isWeak ? " · 弱关联" : ""}`,
+			text: `相关度 ${percentText}${isWeak ? " · 弱关联" : ""}`,
 			cls: "sc-result-score",
 		});
+
+		const thresholdText = this.formatRawScore(threshold);
 		scoreEl.setAttr(
 			"title",
 			[
-				`阈值 ${(threshold * 100).toFixed(0)}%`,
-				`段落(最高) ${(result.bestPassage.score * 100).toFixed(1)}%`,
-				`段落(聚合) ${(result.passageScore * 100).toFixed(1)}%`,
-				`笔记 ${(result.noteScore * 100).toFixed(1)}%`,
-				`综合 ${(result.score * 100).toFixed(1)}%`,
+				`相关度(最强片段): ${percentText}`,
+				`原始分值: ${rawSimilarityText}`,
+				`阈值: ${thresholdText} (${this.formatPercent(threshold)})`,
+				`相关度(多段聚合): ${this.formatPercent(result.passageScore)} (原始分值: ${this.formatRawScore(result.passageScore)})`,
 			].join(" | "),
 		);
 
@@ -295,13 +307,13 @@ export class ConnectionsView extends ItemView {
 		const snippetText = (bestChunk?.text ?? result.bestPassage.text).trim();
 		const range = bestChunk?.range;
 
-		const snippetEl = item.createEl("div", { cls: "sc-result-passage" });
+		const snippetEl = item.createEl("div", { cls: "sc-result-passage sc-connection-snippet" });
 		snippetEl.addEventListener("click", () => {
 			void this.plugin.openNoteInMainLeaf(result.notePath, range);
 		});
 		snippetEl.setAttr(
 			"title",
-			`相似度 ${(rawSimilarity * 100).toFixed(1)}%${isWeak ? "（弱关联）" : ""}`,
+			`最强关联片段 · 相关度 ${percentText} · 原始分值: ${rawSimilarityText}${isWeak ? "（弱关联）" : ""}`,
 		);
 
 		if (headingText) {
@@ -311,17 +323,21 @@ export class ConnectionsView extends ItemView {
 			});
 		}
 
+		const previewLimit = 260;
 		const previewText =
-			snippetText.length > 200 ? snippetText.slice(0, 200) + "..." : snippetText;
+			snippetText.length > previewLimit
+				? snippetText.slice(0, previewLimit) + "..."
+				: snippetText;
 
 		snippetEl.createEl("div", {
 			text: previewText,
 			cls: "sc-passage-text",
 		});
 
-		item.createEl("div", {
+		const pathEl = item.createEl("div", {
 			text: result.notePath,
 			cls: "sc-result-path",
 		});
+		pathEl.setAttr("title", result.notePath);
 	}
 }

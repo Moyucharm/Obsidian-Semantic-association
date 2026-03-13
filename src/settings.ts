@@ -428,7 +428,7 @@ export class SettingTab extends PluginSettingTab {
 		};
 
 		new Setting(containerEl)
-			.setName("匹配阈值")
+			.setName("相关度阈值")
 			.setDesc(
 				"范围 0.0–1.0。阈值越高越严格（更少结果），越低越宽松（更灵敏、更多结果）。无论阈值多高，仍会展示最相关的前 5 条，并将低于阈值的结果标为“弱关联”。",
 			)

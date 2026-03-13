@@ -15,10 +15,15 @@ type Section = {
 // Chunk sizes are tuned for embedding-based semantic retrieval:
 // - Too small → sparse context, similarity scores tend to be unstable/noisy.
 // - Too large → topic dilution and harder passage localization.
-// Target: ~300–500 chars per chunk by default.
-const MIN_CHUNK_LENGTH = 120;
-const MAX_CHUNK_LENGTH = 500;
-const SOFT_SPLIT_FLOOR = Math.max(MIN_CHUNK_LENGTH, Math.floor(MAX_CHUNK_LENGTH * 0.6));
+// Target: ~300–800 chars per chunk by default (good for BGE-M3 local semantics).
+// Add 20% overlap to prevent semantic breaks at cut boundaries.
+const MIN_CHUNK_LENGTH = 300;
+const MAX_CHUNK_LENGTH = 800;
+const CHUNK_OVERLAP_RATIO = 0.2;
+const CHUNK_OVERLAP_LENGTH = Math.floor(MAX_CHUNK_LENGTH * CHUNK_OVERLAP_RATIO);
+// Build "base" chunks first, then prepend overlap from the previous chunk.
+const BASE_MAX_CHUNK_LENGTH = Math.max(MIN_CHUNK_LENGTH, MAX_CHUNK_LENGTH - CHUNK_OVERLAP_LENGTH);
+const SOFT_SPLIT_FLOOR = Math.max(MIN_CHUNK_LENGTH, Math.floor(BASE_MAX_CHUNK_LENGTH * 0.6));
 const SENTENCE_BOUNDARIES = ".!?;\u3002\uFF01\uFF1F\uFF1B";
 const CLAUSE_BOUNDARIES = ",:\uFF0C\u3001\uFF1A";
 
@@ -189,10 +194,8 @@ export class Chunker {
 				}
 
 				const merged = `${currentText}\n\n${fragment.text}`;
-				if (
-					currentText.length < MIN_CHUNK_LENGTH ||
-					merged.length <= MAX_CHUNK_LENGTH
-				) {
+				const maxLength = chunks.length === 0 ? MAX_CHUNK_LENGTH : BASE_MAX_CHUNK_LENGTH;
+				if (merged.length <= maxLength) {
 					currentText = merged;
 					currentEndLine = fragment.endLine;
 					continue;
@@ -208,10 +211,11 @@ export class Chunker {
 		if (currentText) {
 			const trimmed = currentText.trim();
 			const previous = chunks[chunks.length - 1];
+			const maxLength = chunks.length === 1 ? MAX_CHUNK_LENGTH : BASE_MAX_CHUNK_LENGTH;
 			if (
 				trimmed.length < MIN_CHUNK_LENGTH &&
 				previous &&
-				`${previous.text}\n\n${trimmed}`.length <= MAX_CHUNK_LENGTH
+				`${previous.text}\n\n${trimmed}`.length <= maxLength
 			) {
 				previous.text = `${previous.text}\n\n${trimmed}`;
 				previous.endLine = currentEndLine;
@@ -220,7 +224,38 @@ export class Chunker {
 			}
 		}
 
-		return chunks.filter((chunk) => chunk.text.trim().length > 0);
+		const output = chunks.filter((chunk) => chunk.text.trim().length > 0);
+		return this.applyOverlap(output);
+	}
+
+	private applyOverlap(chunks: TextSpan[]): TextSpan[] {
+		if (CHUNK_OVERLAP_LENGTH <= 0 || chunks.length <= 1) {
+			return chunks;
+		}
+
+		const output: TextSpan[] = [chunks[0]];
+		for (let index = 1; index < chunks.length; index++) {
+			const previous = output[output.length - 1];
+			const current = chunks[index];
+
+			const source = previous.text;
+			const overlapText =
+				source.length <= CHUNK_OVERLAP_LENGTH
+					? source
+					: source.slice(source.length - CHUNK_OVERLAP_LENGTH);
+			const overlapStartLine = Math.max(
+				previous.startLine,
+				previous.endLine - this.countNewlines(overlapText),
+			);
+
+			output.push({
+				text: overlapText + current.text,
+				startLine: overlapStartLine,
+				endLine: current.endLine,
+			});
+		}
+
+		return output;
 	}
 
 	private splitIntoBlocks(section: Section): TextSpan[] {
@@ -281,7 +316,7 @@ export class Chunker {
 		if (!trimmedSpan) {
 			return [];
 		}
-		if (trimmedSpan.text.length <= MAX_CHUNK_LENGTH) {
+		if (trimmedSpan.text.length <= BASE_MAX_CHUNK_LENGTH) {
 			return [trimmedSpan];
 		}
 
@@ -289,13 +324,13 @@ export class Chunker {
 		let remaining = trimmedSpan.text;
 		let remainingStartLine = trimmedSpan.startLine;
 
-		while (remaining.length > MAX_CHUNK_LENGTH) {
-			const splitPoint = this.findSplitPoint(remaining, MAX_CHUNK_LENGTH);
+		while (remaining.length > BASE_MAX_CHUNK_LENGTH) {
+			const splitPoint = this.findSplitPoint(remaining, BASE_MAX_CHUNK_LENGTH);
 			const rawSlice = remaining.slice(0, splitPoint);
 			const fragment = rawSlice.trim();
 
 			if (!fragment) {
-				const fallbackRaw = remaining.slice(0, MAX_CHUNK_LENGTH);
+				const fallbackRaw = remaining.slice(0, BASE_MAX_CHUNK_LENGTH);
 				const fallback = fallbackRaw.trim();
 				if (fallback) {
 					fragments.push({
@@ -304,7 +339,7 @@ export class Chunker {
 					});
 				}
 
-				const rawRemaining = remaining.slice(MAX_CHUNK_LENGTH);
+				const rawRemaining = remaining.slice(BASE_MAX_CHUNK_LENGTH);
 				const baseStartLine = remainingStartLine + this.countNewlines(fallbackRaw);
 				const trimmedRemaining = this.trimStartWithLineOffset(
 					rawRemaining,

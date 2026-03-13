@@ -70,7 +70,7 @@ type PersistedIndexSnapshot = {
 };
 
 const CURRENT_INDEX_SNAPSHOT_VERSION = 3;
-const CURRENT_CHUNKING_STRATEGY = "paragraph-first-v2";
+const CURRENT_CHUNKING_STRATEGY = "paragraph-first-v3-overlap20";
 const CURRENT_NOTE_VECTOR_STRATEGY = "chunk-mean-v1";
 const FULL_REBUILD_REMINDER_DAYS = 7;
 const MS_PER_DAY = 86_400_000;

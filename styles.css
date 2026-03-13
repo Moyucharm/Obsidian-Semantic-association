@@ -103,10 +103,9 @@
 .sc-result-path {
 	font-size: 0.75em;
 	color: var(--text-faint);
-	margin-bottom: 4px;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	margin-top: 6px;
+	white-space: normal;
+	word-break: break-word;
 }
 
 .sc-result-passage {
@@ -133,6 +132,10 @@
 	font-size: 0.85em;
 	color: var(--text-normal);
 	line-height: 1.4;
+}
+
+.sc-connection-snippet .sc-passage-text {
+	font-style: italic;
 }
 
 .sc-api-test-result {

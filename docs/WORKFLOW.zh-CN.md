@@ -143,17 +143,24 @@ flowchart TD
 
 ## 4) 「关联视图」到底在匹配什么？（笔记 vs 段落）
 
-当前实现采用“**chunk 召回 + 按笔记聚合**”的方式，核心目标是避免“大笔记的 note-level 向量被均值化后语义稀释”，导致关联召回失败。
+当前实现采用“**chunk 召回 → 候选笔记 → chunk 重打分（找最强片段）**”的方式，核心目标是避免“大笔记的 note-level 向量被均值化后语义稀释”，同时让 UI 展示的片段与排序口径一致。
 
-1. **chunk 召回（chunk-level recall）**：用“当前笔记的查询向量”（优先使用持久化的 note-level 向量；缺失时用当前 chunks 的均值兜底），在全量 **chunk-level 向量** 中检索 topK。
-2. **按笔记聚合**：将命中的 chunks 按 `notePath` 归类（同一篇笔记可以命中多个 chunks）。
-3. **聚合评分（Log-Sum-Exp）**：对每篇候选笔记的 passage 分数做 log-sum-exp 聚合得到 `passageScore`，并用它作为最终排序的 `finalScore`。
+1. **chunk 召回（chunk-level recall）**：用“当前笔记的查询向量”（优先使用持久化的 note-level 向量；缺失时用当前 chunks 的均值兜底），在全量 **chunk-level 向量** 中检索 topK，得到候选笔记集合。
+2. **按笔记聚合**：将命中的 chunks 按 `notePath` 归类（同一篇笔记可以命中多个 chunks），用于候选笔记粗筛。
+3. **chunk 重打分（PassageSelector）**：对每篇候选笔记，计算“候选笔记每个 chunk”与“当前笔记所有 chunks”的最大相似度，选出得分最高的那一段作为 **最强关联片段**（`bestPassage`），并按需截断为 `passages`。
+4. **透明化聚合分值（Log-Sum-Exp）**：对 `passages` 的分数做 log-sum-exp 聚合得到 `passageScore`，用于 tooltip 透明化展示（不再用于主排序）。
 
 分数说明（越大越相关）：
 
-- `noteScore`：该候选笔记的 **最佳命中 chunk 分数**（用于 UI 展示）
-- `passageScore`：该候选笔记命中 chunks 的 **聚合分数**（log-sum-exp）
-- `finalScore = passageScore`
+- `noteScore`：最强关联片段的原始分值（等同 `bestPassage.score`，也是 UI 主显示的「相关度」）
+- `passageScore`：多段聚合分值（log-sum-exp），用于解释“多段同时命中”的强度
+- `finalScore = noteScore`
+
+UI 展示：
+
+- 主界面：`相关度 76.1%`（严格等于 `原始分值 × 100`）
+- Tooltip：`原始分值: 0.761`
+- 卡片正文：直接展示「最强关联片段」的文本预览，帮助快速定位两篇笔记“对上号”的位置
 
 这意味着你在 UI 上看到的是：
 
@@ -164,11 +171,11 @@ flowchart TD
 flowchart TD
   A[当前笔记 notePath] --> B[取查询向量<br/>note vector / chunks 均值兜底]
   B --> C[VectorStore.search 仅搜 chunk 向量]
-  C --> D[按 notePath 聚合命中的 chunks]
-  D --> E[按阈值过滤 + 排序 + 截断为 passages]
-  E --> F[passageScore = Log-Sum-Exp 聚合]
-  F --> G[finalScore = passageScore]
-  G --> H[渲染到右侧关联视图]
+  C --> D[按 notePath 聚合候选笔记]
+  D --> E[PassageSelector: 候选 chunks vs 当前 chunks]
+  E --> F[bestPassage + passages]
+  F --> G[finalScore = bestPassage.score]
+  G --> H[渲染到右侧关联视图（展示最强关联片段）]
 ```
 
 ## 5) 什么是「语义搜索」？项目里落地到哪里了？
@@ -204,5 +211,6 @@ flowchart TD
 
 - 请求体 `input` 是字符串数组（批量）
 - 插件会把每个 chunk 的 embedding payload（`heading + text`）控制在 1200 字符内，并在索引阶段再次验证/必要时二次切分（heading 上下文会先截断到 200 字符，避免超长标题主导 embedding）
+- 默认 chunk 文本长度约 300–800 字符，并带 20% 重叠（stride ≈ 640）；切分策略变更后需要重建索引生效
 
 因此“切分方式是否能被 API 接收”的关键点是：每条 `input` 不要过长、不要为空、批量大小合理；这些在当前实现里都有保护。
